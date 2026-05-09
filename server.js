@@ -14,6 +14,16 @@ const { authRoutes, apuestaRoutes, partidaRoutes, salaRoutes, amigoRoutes, bille
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+function getAllowedOrigins() {
+  const raw = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
+  return raw
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+const allowedOrigins = getAllowedOrigins();
+
 // Middleware de seguridad
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
@@ -21,7 +31,11 @@ app.use(helmet({
 
 // Middleware de CORS
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`Origen no permitido por CORS: ${origin}`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']

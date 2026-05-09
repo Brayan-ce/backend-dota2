@@ -3,11 +3,24 @@ const redis = require('../config/redis');
 const db = require('../config/database');
 const socketEmitter = require('../utils/socketEmitter');
 
+function getAllowedOrigins() {
+  const raw = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
+  return raw
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
 class SocketHandler {
   constructor(server) {
+    const allowedOrigins = getAllowedOrigins();
     this.io = new Server(server, {
       cors: {
-        origin: process.env.FRONTEND_URL || "http://localhost:3000",
+        origin: (origin, callback) => {
+          if (!origin) return callback(null, true);
+          if (allowedOrigins.includes(origin)) return callback(null, true);
+          return callback(new Error(`Origen no permitido por Socket CORS: ${origin}`));
+        },
         methods: ["GET", "POST"],
         credentials: true
       }
