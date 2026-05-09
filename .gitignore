@@ -1,0 +1,11 @@
+# Configuración de seguridad para Ambrysoft
+.env
+node_modules/
+dist/
+*.maFile
+SDA/
+*.log
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db

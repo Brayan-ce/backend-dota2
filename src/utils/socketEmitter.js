@@ -1,0 +1,54 @@
+// Singleton para emitir eventos de socket desde cualquier parte del backend
+let _io = null;
+
+module.exports = {
+  setIo(io) {
+    _io = io;
+  },
+
+  // Emite el nuevo saldo al usuario específico en tiempo real
+  emitirSaldoActualizado(idUsuario, nuevoSaldo) {
+    if (!_io) return;
+    _io.to(`usuario:${idUsuario}`).emit('saldo:actualizado', { saldo: parseFloat(nuevoSaldo) });
+  },
+
+  // Notifica al destinatario que recibió una solicitud de amistad
+  emitirSolicitudAmigo(idDestinatario, solicitud) {
+    if (!_io) return;
+    _io.to(`usuario:${idDestinatario}`).emit('amigo:solicitud', solicitud);
+  },
+
+  // Notifica al solicitante que su solicitud fue aceptada
+  emitirSolicitudAceptada(idSolicitante, amigo) {
+    if (!_io) return;
+    _io.to(`usuario:${idSolicitante}`).emit('amigo:aceptado', amigo);
+  },
+
+  // Emite actualización de sala desde superadmin a todos los clientes
+  emitirActualizacionSalaAdmin(sala) {
+    if (!_io) return;
+    _io.to(`sala:${sala.id}`).emit('sala:actualizada', sala);
+    _io.emit('salas:actualizar', sala);
+    _io.emit('admin:sala:actualizada', sala);
+  },
+
+  // Envía propuesta de intercambio de rol al receptor
+  emitirPropuestaIntercambio(idReceptor, payload) {
+    if (!_io) return;
+    _io.to(`usuario:${idReceptor}`).emit('sala:intercambio-propuesto', payload);
+  },
+
+  // Notifica a todos en la sala que los roles cambiaron (intercambio aceptado)
+  emitirActualizacionSalaSimple(idSala) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('sala:actualizada', { id: idSala });
+    _io.emit('salas:actualizar', { id: idSala });
+  },
+
+  // Notifica al superadmin (y a la sala) que todos los jugadores están listos
+  emitirTodosListos(idSala, payload) {
+    if (!_io) return;
+    _io.emit('admin:sala:todos-listos', payload);
+    _io.to(`sala:${idSala}`).emit('sala:todos-listos', payload);
+  },
+};
