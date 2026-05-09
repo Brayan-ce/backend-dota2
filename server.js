@@ -12,7 +12,7 @@ const { authRoutes, apuestaRoutes, partidaRoutes, salaRoutes, amigoRoutes, bille
 
 // Crear aplicación Express
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3005;
 
 function getAllowedOrigins() {
   const raw = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
