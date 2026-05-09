@@ -3,21 +3,29 @@ const db = require('../../config/database');
 class Usuario {
   // Guardar código de verificación
   static async guardarCodigo(steamId, codigo) {
+    console.log(`💾 Guardando código para steamId: ${steamId}, código: ${codigo}`);
     await db.query('DELETE FROM codigos_verificacion WHERE steam_id = $1', [steamId]);
     const expira = new Date(Date.now() + 10 * 60 * 1000);
     await db.query(
       'INSERT INTO codigos_verificacion (steam_id, codigo, expira_en) VALUES ($1, $2, $3)',
       [steamId, codigo, expira]
     );
+    console.log(`✅ Código guardado exitosamente, expira a las: ${expira.toISOString()}`);
   }
 
   // Verificar código
   static async verificarCodigo(steamId, codigo) {
+    console.log(`🔍 Buscando código para steamId: ${steamId}, código: ${codigo}`);
     const result = await db.query(
       'SELECT * FROM codigos_verificacion WHERE steam_id = $1 AND codigo = $2 AND usado = FALSE AND expira_en > NOW()',
       [steamId, codigo]
     );
-    if (result.rows.length === 0) return false;
+    console.log(`📊 Resultado de búsqueda: ${result.rows.length} fila(s) encontrada(s)`);
+    if (result.rows.length === 0) {
+      console.log(`❌ Código no válido: steam_id=${steamId}, código=${codigo}`);
+      return false;
+    }
+    console.log(`✅ Código válido encontrado, marcando como usado...`);
     await db.query('UPDATE codigos_verificacion SET usado = TRUE WHERE id = $1', [result.rows[0].id]);
     return true;
   }
@@ -35,7 +43,7 @@ class Usuario {
   static async registrar({ steamId, nombreUsuario, avatar, mmr, email, telefono, nombreReal, pais }) {
     const query = `
       INSERT INTO usuarios (steam_id, nombre_usuario, avatar, mmr, saldo, bono, email, telefono, nombre_real, pais, creado_en)
-      VALUES ($1, $2, $3, $4, 10.00, 0.00, $5, $6, $7, $8, NOW())
+      VALUES ($1, $2, $3, $4, 0.00, 10.00, $5, $6, $7, $8, NOW())
       RETURNING *
     `;
     const result = await db.query(query, [steamId, nombreUsuario, avatar, mmr ?? null, email, telefono || null, nombreReal || null, pais || null]);
@@ -46,7 +54,7 @@ class Usuario {
   static async crear(steamId, nombreUsuario, avatar, mmr = null) {
     const query = `
       INSERT INTO usuarios (steam_id, nombre_usuario, avatar, mmr, saldo, bono, creado_en)
-      VALUES ($1, $2, $3, $4, 10.00, 0.00, NOW())
+      VALUES ($1, $2, $3, $4, 0.00, 10.00, NOW())
       RETURNING *
     `;
     

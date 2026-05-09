@@ -66,8 +66,14 @@ router.post('/registro/completar', async (req, res) => {
       return res.status(400).json({ error: 'Faltan datos requeridos' });
     }
 
+    console.log('📋 Registro COMPLETAR - Datos recibidos:', { steamId, codigo, email });
+
     const valido = await Usuario.verificarCodigo(steamId, codigo);
-    if (!valido) return res.status(401).json({ error: 'Código incorrecto o expirado' });
+    console.log('✓ Verificación de código:', valido ? 'EXITOSA' : 'FALLIDA');
+    if (!valido) {
+      console.log('❌ Código incorrecto para steamId:', steamId, 'código:', codigo);
+      return res.status(401).json({ error: 'Código incorrecto o expirado' });
+    }
 
     const jugadorSteam = await steamService.obtenerJugador(steamId);
 
