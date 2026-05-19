@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 const authService = require('../../servicios/auth/auth.service');
 const steamService = require('../../servicios/steam/steam.service');
-const gameCoordinatorService = require('../../servicios/steam/gamecoordinator.service');
-const steamConnectionManager = require('../../servicios/steam/steam-connection-manager');
 const emailService = require('../../servicios/email/email.service');
 const Usuario = require('../../modelos/usuario/usuario.model');
 const db = require('../../config/database');
@@ -135,6 +134,110 @@ router.post('/registro/completar', async (req, res) => {
   }
 });
 
+// ─── REGISTRO SIMPLE (email + password, sin Steam) ─────────────────────────
+router.post('/registro/simple', async (req, res) => {
+  try {
+    const { email, password, nickname, mmr, codigoPromo } = req.body;
+
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Ingresa un email válido' });
+    if (!password || password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+    if (!nickname || !nickname.trim()) return res.status(400).json({ error: 'El nickname es requerido' });
+
+    const emailExistente = await db.query('SELECT id FROM usuarios WHERE LOWER(email) = LOWER($1)', [email.trim()]);
+    if (emailExistente.rows.length > 0) return res.status(409).json({ error: 'Este email ya está registrado' });
+
+    const nicknameExistente = await db.query('SELECT id FROM usuarios WHERE LOWER(nombre_usuario) = LOWER($1)', [nickname.trim()]);
+    if (nicknameExistente.rows.length > 0) return res.status(409).json({ error: 'Este nickname ya está en uso' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const usuario = await Usuario.registrarSimple({
+      email: email.trim(),
+      passwordHash,
+      nickname: nickname.trim(),
+      mmr: mmr ? parseInt(mmr) : null,
+    });
+
+    if (codigoPromo && codigoPromo.trim()) {
+      try {
+        const promoR = await db.query(
+          `SELECT * FROM bonos_promociones WHERE UPPER(codigo)=UPPER($1) AND estado='activo'`,
+          [codigoPromo.trim()]
+        );
+        if (promoR.rows.length > 0) {
+          const promo = promoR.rows[0];
+          await db.query(
+            `UPDATE usuarios SET bono = bono + $1 WHERE id = $2`,
+            [promo.monto, usuario.id]
+          );
+        }
+      } catch (_) {}
+    }
+
+    const token = authService.generarToken(usuario);
+    res.json({
+      mensaje: 'Registro exitoso',
+      token,
+      usuario: {
+        id: usuario.id,
+        steamId: null,
+        nombreUsuario: usuario.nombre_usuario,
+        avatar: null,
+        email: usuario.email,
+        mmr: usuario.mmr ?? null,
+        saldo: usuario.saldo || 0,
+        bono: usuario.bono || 0,
+        nivel: usuario.nivel || 1,
+        alertaBonoRegistroPendiente: false,
+      }
+    });
+  } catch (error) {
+    console.error('Error en registro simple:', error);
+    if (error.code === '23505') return res.status(409).json({ error: 'Email o nickname ya registrado' });
+    res.status(500).json({ error: 'Error al crear la cuenta' });
+  }
+});
+
+// ─── LOGIN SIMPLE (email/nickname + password) ────────────────────────────────────
+router.post('/login/simple', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email/nickname y contraseña son requeridos' });
+
+    const result = await db.query(
+      `SELECT * FROM usuarios 
+       WHERE password_hash IS NOT NULL 
+       AND (LOWER(email) = LOWER($1) OR LOWER(nombre_usuario) = LOWER($1))`,
+      [email.trim()]
+    );
+    const usuario = result.rows[0];
+    if (!usuario) return res.status(401).json({ error: 'Email/nickname o contraseña incorrectos' });
+
+    const valido = await bcrypt.compare(password, usuario.password_hash);
+    if (!valido) return res.status(401).json({ error: 'Email/nickname o contraseña incorrectos' });
+
+    const token = authService.generarToken(usuario);
+    res.json({
+      mensaje: 'Login exitoso',
+      token,
+      usuario: {
+        id: usuario.id,
+        steamId: usuario.steam_id || null,
+        nombreUsuario: usuario.nombre_usuario,
+        avatar: usuario.avatar || null,
+        email: usuario.email,
+        mmr: usuario.mmr ?? null,
+        saldo: usuario.saldo || 0,
+        bono: usuario.bono || 0,
+        nivel: usuario.nivel || 1,
+        alertaBonoRegistroPendiente: usuario.bono_bienvenida_alerta_mostrada === false,
+      }
+    });
+  } catch (error) {
+    console.error('Error en login simple:', error);
+    res.status(500).json({ error: 'Error al iniciar sesión' });
+  }
+});
+
 // ─── LOGIN ───────────────────────────────────────────────────
 // PASO 1: Validar Steam ID y enviar código al email
 router.post('/steam/send-code', async (req, res) => {
@@ -223,15 +326,20 @@ router.get('/refrescar', verificarToken, async (req, res) => {
 // Ruta para verificar token
 router.get('/verificar', verificarToken, async (req, res) => {
   try {
-    const usuarioDB = await Usuario.buscarPorSteamId(req.usuario.steamId);
+    let usuarioDB;
+    if (req.usuario.steamId) {
+      usuarioDB = await Usuario.buscarPorSteamId(req.usuario.steamId);
+    } else {
+      usuarioDB = await Usuario.buscarPorId(req.usuario.id);
+    }
     if (!usuarioDB) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json({
       mensaje: 'Token válido',
       usuario: {
         id: usuarioDB.id,
-        steamId: usuarioDB.steam_id,
+        steamId: usuarioDB.steam_id || null,
         nombreUsuario: usuarioDB.nombre_usuario,
-        avatar: usuarioDB.avatar,
+        avatar: usuarioDB.avatar || null,
           mmr: usuarioDB.mmr ?? null,
         saldo: usuarioDB.saldo ?? 0,
         bono: usuarioDB.bono ?? 0,
@@ -279,22 +387,13 @@ router.get('/mmr/:steamId', async (req, res) => {
 
     console.log(`🎯 Solicitando MMR para: ${steamId}`);
 
-    // Solo usar GC cuando se solicite explícitamente modo exacto/gc.
+    // Nota: GameCoordinator (Steam GC) desactivado - se usa solo OpenDota/STRATZ
+    // El sistema legacy de Steam fue eliminado, ahora el MMR se obtiene
+    // exclusivamente de APIs públicas (OpenDota/STRATZ)
     let resultado = null;
-    if (usarGC) {
-      try {
-        resultado = await gameCoordinatorService.obtenerMMRReal(steamId);
-      } catch (gcErr) {
-        console.log('GC falló, usando fallback:', gcErr.message);
-      }
-    }
-
-    // Fallback a OpenDota/STRATZ si GC no está disponible
-    if (!resultado || resultado.mmr === null || resultado.mmr === undefined) {
-      const stats = await steamService.obtenerEstadisticasDota2(steamId);
-      if (stats && stats.mmr) {
-        resultado = stats;
-      }
+    const stats = await steamService.obtenerEstadisticasDota2(steamId);
+    if (stats && stats.mmr) {
+      resultado = stats;
     }
 
     if (!resultado || resultado.mmr === null) {
@@ -367,42 +466,22 @@ router.get('/mmr-stream/:steamId', async (req, res) => {
     let fuenteFinal = 'No disponible';
     let rankTier = null;
 
-    try {
-      const gcResult = await gameCoordinatorService.obtenerMMRReal(steamId);
-      if (gcResult && gcResult.mmr) {
-        mmrFinal = gcResult.mmr;
-        fuenteFinal = gcResult.fuente;
-        rankTier = gcResult.rank_tier;
-        send({
-          estado: 'mmr_ok',
-          mensaje: 'MMR obtenido via GameCoordinator',
-          mmr: mmrFinal,
-          fuente: fuenteFinal,
-          rank_tier: rankTier
-        });
-      }
-    } catch (gcErr) {
-      send({ estado: 'gc_fallback', mensaje: 'GameCoordinator no disponible, usando APIs públicas...' });
-    }
-
-    // Paso 3: Fallback a OpenDota/STRATZ
-    if (!mmrFinal) {
-      send({ estado: 'opendota', mensaje: 'Consultando OpenDota y STRATZ...' });
-      const stats = await steamService.obtenerEstadisticasDota2(steamId);
-      if (stats && stats.mmr) {
-        mmrFinal = stats.mmr;
-        fuenteFinal = stats.fuente;
-        rankTier = stats.rank_tier;
-        send({
-          estado: 'mmr_ok',
-          mensaje: 'MMR obtenido',
-          mmr: mmrFinal,
-          fuente: fuenteFinal,
-          rank_tier: rankTier
-        });
-      } else {
-        send({ estado: 'mmr_null', mensaje: 'MMR no disponible (perfil privado)', mmr: null });
-      }
+    // Nota: GameCoordinator desactivado - usando solo OpenDota/STRATZ
+    send({ estado: 'opendota', mensaje: 'Consultando OpenDota y STRATZ...' });
+    const stats = await steamService.obtenerEstadisticasDota2(steamId);
+    if (stats && stats.mmr) {
+      mmrFinal = stats.mmr;
+      fuenteFinal = stats.fuente;
+      rankTier = stats.rank_tier;
+      send({
+        estado: 'mmr_ok',
+        mensaje: 'MMR obtenido',
+        mmr: mmrFinal,
+        fuente: fuenteFinal,
+        rank_tier: rankTier
+      });
+    } else {
+      send({ estado: 'mmr_null', mensaje: 'MMR no disponible (perfil privado)', mmr: null });
     }
 
     // Paso 4: Final

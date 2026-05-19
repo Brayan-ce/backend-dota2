@@ -50,12 +50,13 @@ class SocketHandler {
         if (!user || !mensaje?.trim()) return;
         try {
           const r = await db.query(
-            'INSERT INTO mensajes_chat_general (id_usuario, mensaje) VALUES ($1,$2) RETURNING *',
-            [user.id, mensaje.trim().slice(0, 300)]
+            'INSERT INTO mensajes_chat_general (id_usuario, mensaje, tipo) VALUES ($1,$2,$3) RETURNING *',
+            [user.id, mensaje.trim().slice(0, 300), 'texto']
           );
           const msg = {
             id: r.rows[0].id,
             mensaje: r.rows[0].mensaje,
+            tipo: 'texto',
             creado_en: r.rows[0].creado_en,
             nombre_usuario: user.nombre,
             avatar: user.avatar,
@@ -63,6 +64,42 @@ class SocketHandler {
           };
           this.io.emit('chat-general:mensaje', msg);
         } catch (e) { console.error('chat-general error:', e.message); }
+      });
+
+      // ── Sticker en chat general (1-5 públicos, 6-90 premium: saldo >= 1000) ──
+      socket.on('chat-general:sticker', async ({ stickerId }) => {
+        const user = this.usuariosConectados.get(socket.id);
+        console.log('[sticker] user:', user?.id, '| stickerId:', stickerId);
+        if (!user) { console.log('[sticker] usuario no autenticado en socket'); return; }
+        const id = parseInt(stickerId, 10);
+        if (!Number.isFinite(id) || id < 1 || id > 90) { console.log('[sticker] id inválido:', id); return; }
+        const esPublico = id <= 5;
+        try {
+          if (!esPublico) {
+            const saldoR = await db.query('SELECT saldo FROM usuarios WHERE id=$1', [user.id]);
+            if (!saldoR.rows.length) return;
+            const saldo = parseFloat(saldoR.rows[0].saldo);
+            if (saldo < 1000) {
+              socket.emit('chat-general:sticker-error', { error: 'Necesitas S/ 1,000.00 o más en tu cuenta para usar stickers.' });
+              return;
+            }
+          }
+          const r = await db.query(
+            'INSERT INTO mensajes_chat_general (id_usuario, mensaje, tipo, sticker_id) VALUES ($1,$2,$3,$4) RETURNING *',
+            [user.id, `sticker:${id}`, 'sticker', id]
+          );
+          const msg = {
+            id: r.rows[0].id,
+            mensaje: r.rows[0].mensaje,
+            tipo: 'sticker',
+            sticker_id: id,
+            creado_en: r.rows[0].creado_en,
+            nombre_usuario: user.nombre,
+            avatar: user.avatar,
+            nivel: user.nivel
+          };
+          this.io.emit('chat-general:mensaje', msg);
+        } catch (e) { console.error('chat-general:sticker error:', e.message); }
       });
 
       // ── Chat privado ──────────────────────────────────────────
@@ -141,6 +178,17 @@ class SocketHandler {
         } catch (e) { console.error('chat-sala error:', e.message); }
       });
 
+      // ── Sorteo 1v1 ────────────────────────────────────────────
+      socket.on('sala:sorteo1v1:iniciar', ({ idSala }) => {
+        // Notificar a todos en la sala que inicie el sorteo
+        this.io.to(`sala:${idSala}`).emit('sala:sorteo1v1:iniciar');
+      });
+
+      socket.on('sala:sorteo1v1:completado', ({ idSala, banda }) => {
+        // Notificar a todos en la sala el resultado del sorteo
+        this.io.to(`sala:${idSala}`).emit('sala:sorteo1v1:completado', { idSala, banda });
+      });
+
       // ── Partidas legacy ───────────────────────────────────────
       socket.on('unirse-partida', (matchId) => { socket.join(`partida:${matchId}`); });
       socket.on('salir-partida', (matchId) => { socket.leave(`partida:${matchId}`); });
@@ -172,29 +220,26 @@ class SocketHandler {
   }
 
   setupRedisSubscriptions() {
+    if (redis.status === 'mock') {
+      return;
+    }
+
     // Suscribirse a actualizaciones de partidas
     const subscriber = redis.duplicate();
-    
-    subscriber.subscribe('partida:actualizacion', (err) => {
-      if (err) {
-        console.error('Error al suscribirse a partida:actualizacion:', err);
-        return;
-      }
+
+    subscriber.on('error', (err) => {
+      console.log('⚠️ Redis subscriber no disponible, realtime por Redis desactivado:', err.code || err.message);
     });
 
-    subscriber.subscribe('partida:finalizada', (err) => {
-      if (err) {
-        console.error('Error al suscribirse a partida:finalizada:', err);
-        return;
-      }
-    });
-
-    subscriber.subscribe('apuestas:actualizadas', (err) => {
-      if (err) {
-        console.error('Error al suscribirse a apuestas:actualizadas:', err);
-        return;
-      }
-    });
+    subscriber.connect()
+      .then(async () => {
+        await subscriber.subscribe('partida:actualizacion');
+        await subscriber.subscribe('partida:finalizada');
+        await subscriber.subscribe('apuestas:actualizadas');
+      })
+      .catch((err) => {
+        console.log('⚠️ No se pudo conectar subscriber Redis:', err.code || err.message);
+      });
 
     // Manejar mensajes de Redis
     subscriber.on('message', (channel, message) => {

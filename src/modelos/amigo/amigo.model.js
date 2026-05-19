@@ -6,8 +6,10 @@ class Amigo {
       SELECT a.id, a.estado, a.creado_en,
         u.id AS amigo_id, u.nombre_usuario, u.avatar, u.mmr
       FROM amigos a
-      JOIN usuarios u ON u.id = CASE WHEN a.id_usuario=$1 THEN a.id_amigo ELSE a.id_usuario END
-      WHERE (a.id_usuario=$1 OR a.id_amigo=$1) AND a.estado='aceptado'
+      JOIN usuarios u ON u.id = CASE WHEN a.id_usuario = $1::INTEGER THEN a.id_amigo ELSE a.id_usuario END
+      WHERE (a.id_usuario = $1::INTEGER OR a.id_amigo = $1::INTEGER) 
+        AND a.estado='aceptado'
+        AND a.id_usuario != a.id_amigo
       ORDER BY u.nombre_usuario
     `;
     const r = await db.query(q, [idUsuario]);
@@ -32,6 +34,14 @@ class Amigo {
 
   static async rechazar(idSolicitud, idUsuario) {
     await db.query('DELETE FROM amigos WHERE id=$1 AND id_amigo=$2', [idSolicitud, idUsuario]);
+  }
+
+  static async eliminarAmistad(idUsuario, idAmigo) {
+    const r = await db.query(
+      'DELETE FROM amigos WHERE (id_usuario=$1 AND id_amigo=$2) OR (id_usuario=$2 AND id_amigo=$1) RETURNING *',
+      [idUsuario, idAmigo]
+    );
+    return r.rows[0];
   }
 
   static async solicitudesPendientes(idUsuario) {

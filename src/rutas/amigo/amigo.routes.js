@@ -116,4 +116,36 @@ router.post('/rechazar/:idSolicitud', verificarToken, async (req, res) => {
   }
 });
 
+// Estado de relación con un usuario
+router.get('/estado/:idUsuario', verificarToken, async (req, res) => {
+  try {
+    const idUsuario = parseInt(req.params.idUsuario);
+    if (idUsuario === req.usuario.id) return res.json({ estado: 'mismo_usuario' });
+    const r = await db.query(
+      'SELECT id, estado, id_usuario FROM amigos WHERE (id_usuario=$1 AND id_amigo=$2) OR (id_usuario=$2 AND id_amigo=$1)',
+      [req.usuario.id, idUsuario]
+    );
+    if (r.rows.length === 0) return res.json({ estado: 'ninguno' });
+    const row = r.rows[0];
+    if (row.estado === 'aceptado') return res.json({ estado: 'amigos', id: row.id });
+    if (row.estado === 'pendiente' && row.id_usuario === req.usuario.id) return res.json({ estado: 'solicitud_enviada', id: row.id });
+    if (row.estado === 'pendiente') return res.json({ estado: 'solicitud_recibida', id: row.id });
+    res.json({ estado: 'ninguno' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Eliminar amistad (dejar de ser amigos)
+router.delete('/eliminar/:idAmigo', verificarToken, async (req, res) => {
+  try {
+    const idAmigo = parseInt(req.params.idAmigo);
+    const r = await Amigo.eliminarAmistad(req.usuario.id, idAmigo);
+    if (!r) return res.status(404).json({ error: 'Amistad no encontrada' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

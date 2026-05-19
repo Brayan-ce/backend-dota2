@@ -816,6 +816,10 @@ router.post('/salas/:id/iniciar', verificarSuperadminToken, async (req, res) => 
       return res.status(400).json({ error: 'La sala no está en estado esperando' });
     }
     const salaBase = salaR.rows[0];
+    if (parseInt(salaBase.jugadores_actuales) < parseInt(salaBase.max_jugadores)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `La sala no está llena (${salaBase.jugadores_actuales}/${salaBase.max_jugadores}). Espera a que se complete.` });
+    }
 
     const liveExistente = await client.query(
       'SELECT id FROM partidas_en_vivo WHERE id_sala=$1 ORDER BY activo DESC, creada_en DESC LIMIT 1',
@@ -908,14 +912,147 @@ router.post('/salas/:id/iniciar', verificarSuperadminToken, async (req, res) => 
       partida_vivo_delay_segundos: live.delay_segundos,
     };
 
+    // Obtener jugadores ANTES de cerrar la transacción
+    const jugadoresQuery = await client.query(
+      `SELECT u.id, u.nombre_usuario, u.steam_id, sj.equipo
+       FROM sala_jugadores sj
+       JOIN usuarios u ON u.id = sj.id_usuario
+       WHERE sj.id_sala = $1 AND u.steam_id IS NOT NULL`,
+      [id]
+    );
+    
+    const jugadores = jugadoresQuery.rows.map(j => ({
+      steamId: j.steam_id,
+      name: j.nombre_usuario,
+      team: j.equipo === 'dire' ? 1 : 0 // 0 = Radiant, 1 = Dire
+    }));
+    
+    // Generar contraseña aleatoria para el lobby
+    const lobbyPassword = Math.random().toString(36).substring(2, 8).toUpperCase();
+    
     socketEmitter.emitirActualizacionSalaAdmin(salaActualizada);
-    return res.json({ sala: salaActualizada, partidaEnVivo: live });
+
+    // Crear lobby en Dota 2 automáticamente mediante el bot C#
+    // Usamos setImmediate para no bloquear la respuesta HTTP
+    setImmediate(async () => {
+      let updateClient;
+      try {
+        const dotaBotService = require('../../servicios/dota-bot/dotaBot.service');
+        
+        console.log(`[SALA] Creando lobby automático para sala #${id} con ${jugadores.length} jugadores...`);
+        
+        // Llamar al bot C# para crear el lobby
+        const botResponse = await dotaBotService.createLobby({
+          salaId: id,
+          nombre: tituloFinal,
+          password: lobbyPassword,
+          gameMode: 1, // All Pick
+          jugadores: jugadores
+        });
+        
+        if (botResponse.success) {
+          console.log(`[SALA] Lobby creado automáticamente: ${botResponse.lobbyId}`);
+          
+          // Actualizar sala con el lobby ID (nueva conexión)
+          updateClient = await db.pool.connect();
+          await updateClient.query(
+            'UPDATE salas SET lobby_id = $1, lobby_estado = $2 WHERE id = $3',
+            [botResponse.lobbyId, 'creado', id]
+          );
+          
+          // Notificar a jugadores via socket
+          socketEmitter.emitirLobbyCreado(id, {
+            idSala: id,
+            lobbyId: botResponse.lobbyId,
+            lobbyPassword: botResponse.password,
+            mensaje: `¡Lobby creado! ID: ${botResponse.lobbyId}${botResponse.password ? ` | Password: ${botResponse.password}` : ''}`
+          });
+          
+          console.log(`[SALA] Jugadores notificados del lobby ${botResponse.lobbyId}`);
+        } else {
+          console.error(`[SALA] Error creando lobby automático: ${botResponse.message}`);
+        }
+      } catch (err) {
+        console.error(`[SALA] Error en creación automática de lobby:`, err.message);
+      } finally {
+        if (updateClient) updateClient.release();
+      }
+    });
+
+    return res.json({ 
+      sala: salaActualizada, 
+      partidaEnVivo: live,
+      mensaje: 'Sala iniciada. El lobby se está creando automáticamente...'
+    });
   } catch (error) {
     if (client) {
       try { await client.query('ROLLBACK'); } catch (_) {}
     }
     console.error('Error al iniciar sala:', error);
     return res.status(500).json({ error: 'Error al iniciar sala' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// Endpoint para que superadmin ingrese el lobby_id de Dota 2 manualmente
+router.post('/salas/:id/lobby', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  const { lobby_id, lobby_password } = req.body;
+  
+  if (!lobby_id) {
+    return res.status(400).json({ error: 'lobby_id es requerido' });
+  }
+  
+  let client;
+  try {
+    client = await db.pool.connect();
+    
+    // Verificar que la sala existe y está en estado jugando
+    const salaR = await client.query('SELECT * FROM salas WHERE id=$1', [id]);
+    if (!salaR.rows.length) {
+      return res.status(404).json({ error: 'Sala no encontrada' });
+    }
+    
+    const sala = salaR.rows[0];
+    if (sala.estado !== 'jugando') {
+      return res.status(400).json({ error: 'La sala debe estar en estado "jugando" para asignar un lobby' });
+    }
+    
+    // Actualizar sala con el lobby_id
+    const upd = await client.query(
+      `UPDATE salas SET lobby_id=$1, lobby_password=$2, lobby_estado='creado', actualizada_en=NOW() WHERE id=$3 RETURNING *`,
+      [lobby_id, lobby_password || null, id]
+    );
+    
+    // Obtener jugadores para notificarles
+    const jugadoresR = await client.query(
+      `SELECT u.id, u.nombre_usuario, u.steam_id 
+       FROM sala_jugadores sj 
+       JOIN usuarios u ON u.id = sj.id_usuario 
+       WHERE sj.id_sala=$1`,
+      [id]
+    );
+    
+    // Notificar a todos los jugadores via socket
+    socketEmitter.emitirLobbyCreado(Number(id), {
+      idSala: Number(id),
+      lobbyId: lobby_id,
+      lobbyPassword: lobby_password || null,
+      jugadores: jugadoresR.rows,
+      mensaje: `¡El lobby de Dota 2 está listo! ID: ${lobby_id}${lobby_password ? ` | Contraseña: ${lobby_password}` : ''}`
+    });
+    
+    socketEmitter.emitirActualizacionSalaAdmin(upd.rows[0]);
+    
+    return res.json({ 
+      ok: true, 
+      sala: upd.rows[0],
+      mensaje: 'Lobby asignado correctamente. Los jugadores han sido notificados.'
+    });
+  } catch (error) {
+    console.error('Error al asignar lobby:', error);
+    return res.status(500).json({ error: 'Error al asignar lobby' });
   } finally {
     if (client) client.release();
   }

@@ -3,7 +3,7 @@ CREATE SCHEMA public;
 
 CREATE TABLE IF NOT EXISTS usuarios (
     id SERIAL PRIMARY KEY,
-    steam_id VARCHAR(20) UNIQUE NOT NULL,
+    steam_id VARCHAR(20) UNIQUE,
     nombre_usuario VARCHAR(100) NOT NULL,
     avatar VARCHAR(500),
     mmr INTEGER,
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
     telefono VARCHAR(20),
     nombre_real VARCHAR(150),
     pais VARCHAR(60),
+    password_hash VARCHAR(255),
     bono_bienvenida_alerta_mostrada BOOLEAN NOT NULL DEFAULT FALSE,
     steam_actualizado_en TIMESTAMP DEFAULT NOW(),
     creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -71,6 +72,11 @@ CREATE TABLE IF NOT EXISTS salas (
     fecha_inicio TIMESTAMP,
     aviso_admin BOOLEAN NOT NULL DEFAULT FALSE,
     configuracion JSONB,
+    lobby_id VARCHAR(50),
+    lobby_password VARCHAR(20),
+    lobby_estado VARCHAR(30) NOT NULL DEFAULT 'sin_lobby',
+    banda_vacante VARCHAR(20),
+    sorteo_pendiente BOOLEAN NOT NULL DEFAULT TRUE,
     creada_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     actualizada_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -139,6 +145,7 @@ CREATE TABLE IF NOT EXISTS sala_jugadores (
     banda VARCHAR(10) NOT NULL DEFAULT 'radiant',
     equipo VARCHAR(20),
     listo BOOLEAN NOT NULL DEFAULT FALSE,
+    sorteado BOOLEAN NOT NULL DEFAULT FALSE,
     unido_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id_sala, id_usuario)
 );
@@ -156,7 +163,10 @@ CREATE TABLE IF NOT EXISTS mensajes_chat_general (
     id SERIAL PRIMARY KEY,
     id_usuario INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
     mensaje TEXT NOT NULL,
-    creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    tipo VARCHAR(10) NOT NULL DEFAULT 'texto',
+    sticker_id INTEGER,
+    creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (tipo IN ('texto', 'sticker'))
 );
 
 CREATE TABLE IF NOT EXISTS mensajes_chat_privado (
@@ -404,7 +414,7 @@ CREATE TABLE IF NOT EXISTS retiros_solicitudes (
 CREATE TABLE IF NOT EXISTS mmr_actualizaciones (
     id SERIAL PRIMARY KEY,
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
-    steam_id VARCHAR(32) NOT NULL,
+    steam_id VARCHAR(32),
     estado VARCHAR(20) NOT NULL DEFAULT 'pendiente',
     mensaje TEXT,
     solicitado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -432,7 +442,7 @@ CREATE TABLE IF NOT EXISTS mmr_control_global (
 CREATE TABLE IF NOT EXISTS mmr_acciones_usuario (
     id SERIAL PRIMARY KEY,
     usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
-    steam_id VARCHAR(32) NOT NULL,
+    steam_id VARCHAR(32),
     boton VARCHAR(30) NOT NULL,
     fuente VARCHAR(120),
     mmr_valor INTEGER,
@@ -441,6 +451,8 @@ CREATE TABLE IF NOT EXISTS mmr_acciones_usuario (
 );
 
 CREATE INDEX IF NOT EXISTS idx_usuarios_steam_id ON usuarios(steam_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_email ON usuarios(LOWER(email)) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_salas_lobby_id ON salas(lobby_id) WHERE lobby_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_usuarios_steam_actualizado ON usuarios(steam_actualizado_en);
 CREATE INDEX IF NOT EXISTS idx_codigos_steam_id ON codigos_verificacion(steam_id);
 CREATE INDEX IF NOT EXISTS idx_codigos_expira ON codigos_verificacion(expira_en);

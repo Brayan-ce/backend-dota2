@@ -4,7 +4,6 @@ const db = require('../../config/database');
 const { verificarToken } = require('../../middleware/auth');
 const emailService = require('../../servicios/email/email.service');
 const steamService = require('../../servicios/steam/steam.service');
-const gameCoordinatorService = require('../../servicios/steam/gamecoordinator.service');
 
 const MMR_USER_COOLDOWN_HOURS = 24;
 const MMR_GLOBAL_SLOT_MINUTES = 20;
@@ -37,7 +36,7 @@ async function registrarAccionMMR(client, { usuarioId, steamId, boton, fuente, m
   await client.query(
     `INSERT INTO mmr_acciones_usuario (usuario_id, steam_id, boton, fuente, mmr_valor, detalle)
      VALUES ($1, $2, $3, $4, $5, $6)`,
-    [usuarioId, steamId, boton, fuente || null, mmrValor, detalle]
+    [usuarioId, steamId || null, boton, fuente || null, mmrValor, detalle]
   );
 }
 
@@ -77,7 +76,8 @@ async function procesarColaMMR() {
 
       const job = claim.rows[0];
       try {
-        const result = await gameCoordinatorService.obtenerMMRReal(job.steam_id);
+        // Nota: GameCoordinator desactivado - usando OpenDota/STRATZ
+        const result = await steamService.obtenerEstadisticasDota2(job.steam_id);
 
         if (result && result.mmr !== null && result.mmr !== undefined) {
           await db.query(`UPDATE usuarios SET mmr = $1, actualizado_en = NOW() WHERE id = $2`, [result.mmr, job.usuario_id]);
@@ -85,7 +85,7 @@ async function procesarColaMMR() {
             `UPDATE mmr_actualizaciones
              SET estado='completado', procesado_en=NOW(), mmr_obtenido=$1, fuente=$2, mensaje=$3
              WHERE id=$4`,
-            [result.mmr, result.fuente || 'GameCoordinator API', 'MMR actualizado correctamente', job.id]
+            [result.mmr, result.fuente || 'OpenDota/STRATZ', 'MMR actualizado correctamente', job.id]
           );
           await liberarSolicitudActiva(job.usuario_id, job.id);
         } else {
@@ -93,7 +93,7 @@ async function procesarColaMMR() {
             `UPDATE mmr_actualizaciones
              SET estado='fallido', procesado_en=NOW(), mensaje=$1
              WHERE id=$2`,
-            ['No se pudo obtener MMR real desde GameCoordinator. Intenta más tarde.', job.id]
+            ['No se pudo obtener MMR desde OpenDota/STRATZ. El perfil puede ser privado.', job.id]
           );
           await liberarSolicitudActiva(job.usuario_id, job.id);
         }

@@ -155,6 +155,28 @@ class Usuario {
     }
   }
 
+  // Buscar usuario por ID
+  static async buscarPorId(id) {
+    const result = await db.query('SELECT * FROM usuarios WHERE id = $1', [id]);
+    return result.rows[0];
+  }
+
+  // Registrar usuario simple (email + password, sin Steam)
+  static async registrarSimple({ email, passwordHash, nickname, mmr }) {
+    const query = `
+      INSERT INTO usuarios (nombre_usuario, email, password_hash, mmr, saldo, bono, creado_en)
+      VALUES ($1, $2, $3, $4, 0.00, 10.00, NOW())
+      RETURNING *
+    `;
+    const result = await db.query(query, [
+      nickname.trim(),
+      email.toLowerCase().trim(),
+      passwordHash,
+      mmr ?? null
+    ]);
+    return result.rows[0];
+  }
+
   // Actualizar MMR del usuario
   static async actualizarMMR(id, nuevoMMR) {
     const query = `

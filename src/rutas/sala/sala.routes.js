@@ -147,11 +147,13 @@ router.post('/:id/avisar-admin', verificarToken, async (req, res) => {
   try {
     const sala = await Sala.buscarPorId(req.params.id);
     if (!sala) return res.status(404).json({ error: 'Sala no encontrada' });
-    await Sala.avisarAdmin(req.params.id, req.usuario.id);
+    const salaActualizada = await Sala.avisarAdmin(req.params.id, req.usuario.id);
     await db.query(
       `INSERT INTO mensajes_soporte (id_usuario, mensaje, es_admin, creado_en) VALUES ($1, $2, FALSE, NOW())`,
       [req.usuario.id, `⚠️ SALA LISTA: "${sala.nombre}" (ID #${sala.id}) está llena y la hora de inicio llegó. Crear sala en Dota 2 y enviar link a los ${sala.jugadores_actuales} jugadores.`]
     );
+    // Emitir actualización a superadmin para mostrar alerta en tiempo real
+    socketEmitter.emitirActualizacionSalaAdmin(salaActualizada);
     res.json({ ok: true, mensaje: 'Aviso enviado al administrador' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -163,11 +165,58 @@ router.post('/:id/cambiar-banda', verificarToken, async (req, res) => {
     const { banda } = req.body;
     if (!['radiant','dire'].includes(banda)) return res.status(400).json({ error: 'Banda inválida' });
     const r = await db.query(
-      'UPDATE sala_jugadores SET banda=$1 WHERE id_sala=$2 AND id_usuario=$3 RETURNING *',
+      'UPDATE sala_jugadores SET banda=$1, sorteado=TRUE WHERE id_sala=$2 AND id_usuario=$3 RETURNING *',
       [banda, req.params.id, req.usuario.id]
     );
     if (r.rows.length === 0) return res.status(404).json({ error: 'No estás en esta sala' });
     res.json({ ok: true, banda });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Sorteo 1v1: asigna bandas opuestas a ambos jugadores atómicamente ────────
+router.post('/:id/sorteo-1v1', verificarToken, async (req, res) => {
+  try {
+    const idSala = req.params.id;
+    // Verificar que el solicitante está en la sala
+    const estaR = await db.query(
+      'SELECT id FROM sala_jugadores WHERE id_sala=$1 AND id_usuario=$2',
+      [idSala, req.usuario.id]
+    );
+    if (!estaR.rows.length) return res.status(403).json({ error: 'No estás en esta sala' });
+
+    // Obtener los dos jugadores de la sala 1v1
+    const jugadoresR = await db.query(
+      'SELECT id_usuario FROM sala_jugadores WHERE id_sala=$1 ORDER BY unido_en ASC LIMIT 2',
+      [idSala]
+    );
+    if (jugadoresR.rows.length < 2) return res.status(400).json({ error: 'La sala no tiene 2 jugadores aún' });
+
+    // Sorteo: decidir quién es radiant y quién dire
+    const esRadiantPrimero = Math.random() < 0.5;
+    const idPrimero = jugadoresR.rows[0].id_usuario;
+    const idSegundo = jugadoresR.rows[1].id_usuario;
+    const bandaPrimero = esRadiantPrimero ? 'radiant' : 'dire';
+    const bandaSegundo = esRadiantPrimero ? 'dire' : 'radiant';
+
+    // Asignar bandas a ambos jugadores en una sola transacción
+    await db.query(
+      'UPDATE sala_jugadores SET banda=$1, sorteado=TRUE WHERE id_sala=$2 AND id_usuario=$3',
+      [bandaPrimero, idSala, idPrimero]
+    );
+    await db.query(
+      'UPDATE sala_jugadores SET banda=$1, sorteado=TRUE WHERE id_sala=$2 AND id_usuario=$3',
+      [bandaSegundo, idSala, idSegundo]
+    );
+
+    socketEmitter.emitirActualizacionSalaSimple(Number(idSala));
+
+    res.json({
+      ok: true,
+      [idPrimero]: bandaPrimero,
+      [idSegundo]: bandaSegundo,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -216,13 +265,26 @@ router.post('/:id/entrar', verificarToken, async (req, res) => {
       );
     }
 
-    const bandaRadiant = await client.query("SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1 AND banda='radiant'", [sala.id]);
-    const bandaDire = await client.query("SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1 AND banda='dire'", [sala.id]);
-    const mitad = Math.ceil(parseInt(sala.max_jugadores) / 2);
-    const banda = parseInt(bandaRadiant.rows[0].count) < mitad ? 'radiant' : 'dire';
+    // Verificar si hay banda vacante (alguien se salió después del sorteo en 1v1)
+    let banda;
+    let sorteado = false;
+    if (sala.banda_vacante) {
+      // El siguiente jugador entra en la banda del que se salió (sin sorteo)
+      banda = sala.banda_vacante;
+      sorteado = true; // Se considera sorteado porque ya se hizo el sorteo antes
+      // Limpiar la banda vacante para que no se use de nuevo
+      await client.query('UPDATE salas SET banda_vacante=NULL WHERE id=$1', [sala.id]);
+    } else {
+      // Asignación normal por balance
+      const bandaRadiant = await client.query("SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1 AND banda='radiant'", [sala.id]);
+      const bandaDire = await client.query("SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1 AND banda='dire'", [sala.id]);
+      const mitad = Math.ceil(parseInt(sala.max_jugadores) / 2);
+      banda = parseInt(bandaRadiant.rows[0].count) < mitad ? 'radiant' : 'dire';
+    }
+
     await client.query(
-      'INSERT INTO sala_jugadores (id_sala, id_usuario, banda, equipo) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
-      [sala.id, req.usuario.id, banda, rolPreferido]
+      'INSERT INTO sala_jugadores (id_sala, id_usuario, banda, equipo, sorteado) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
+      [sala.id, req.usuario.id, banda, rolPreferido, sorteado]
     );
     const updated = await client.query(
       'UPDATE salas SET jugadores_actuales=(SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1), actualizada_en=NOW() WHERE id=$1 RETURNING *',
@@ -239,6 +301,7 @@ router.post('/:id/entrar', verificarToken, async (req, res) => {
       ? (await db.query('SELECT saldo FROM usuarios WHERE id=$1', [req.usuario.id])).rows[0].saldo
       : null;
     if (nuevoSaldo !== null) socketEmitter.emitirSaldoActualizado(req.usuario.id, nuevoSaldo);
+    socketEmitter.emitirActualizacionSalaSimple(Number(sala.id));
     res.json({ sala: updated.rows[0], nuevoSaldo, banda });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -266,6 +329,33 @@ router.post('/:id/salir', verificarToken, async (req, res) => {
     if (estaR.rows.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'No estás en esta sala' }); }
 
     await client.query('DELETE FROM sala_jugadores WHERE id_sala=$1 AND id_usuario=$2', [sala.id, req.usuario.id]);
+
+    // Verificar si es modo 1v1 y el sorteo ya se hizo (hay bando asignado)
+    const es1v1 = parseInt(sala.max_jugadores) === 2;
+    const sorteoHecho = await client.query(
+      'SELECT banda FROM sala_jugadores WHERE id_sala=$1 AND id_usuario=$2 AND sorteado=TRUE',
+      [sala.id, req.usuario.id]
+    );
+
+    let sancionAplicada = false;
+    if (es1v1 && sorteoHecho.rows.length > 0) {
+      // En 1v1, el sorteo determina dos CAPITANES (Radiant y Dire)
+      // La sanción de -5 aplica a CUALQUIERA que salga después del sorteo
+      await client.query('UPDATE usuarios SET saldo = saldo - 5 WHERE id = $1', [req.usuario.id]);
+      await client.query(
+        `INSERT INTO transacciones (id_usuario, tipo, monto, descripcion, creado_en)
+         VALUES ($1, 'sancion', -5, $2, NOW())`,
+        [req.usuario.id, `Sanción -5 al CAPITÁN por abandonar sala 1v1 #${sala.id}`]
+      );
+      sancionAplicada = true;
+
+      // Marcar la sala para que el siguiente entre sin sorteo (guardar banda del capitán que se salió)
+      await client.query(
+        'UPDATE salas SET banda_vacante=$1, sorteo_pendiente=FALSE WHERE id=$2',
+        [sorteoHecho.rows[0].banda, sala.id]
+      );
+    }
+
     const updated = await client.query(
       'UPDATE salas SET jugadores_actuales=(SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1), actualizada_en=NOW() WHERE id=$1 RETURNING *',
       [sala.id]
@@ -282,16 +372,64 @@ router.post('/:id/salir', verificarToken, async (req, res) => {
     }
 
     await client.query('COMMIT');
-    const nuevoSaldo = entrada > 0
+    const nuevoSaldo = (entrada > 0 || sancionAplicada)
       ? (await db.query('SELECT saldo FROM usuarios WHERE id=$1', [req.usuario.id])).rows[0].saldo
       : null;
     if (nuevoSaldo !== null) socketEmitter.emitirSaldoActualizado(req.usuario.id, nuevoSaldo);
-    res.json({ sala: updated.rows[0], nuevoSaldo });
+    socketEmitter.emitirActualizacionSalaSimple(Number(sala.id));
+    res.json({ sala: updated.rows[0], nuevoSaldo, sancion: sancionAplicada ? -100 : 0 });
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     res.status(500).json({ error: e.message });
   } finally {
     if (client) client.release();
+  }
+});
+
+router.get('/actividad-reciente', async (req, res) => {
+  try {
+    const ganadores = await db.query(`
+      SELECT
+        'ganador' AS tipo,
+        u.nombre_usuario,
+        u.avatar,
+        s.nombre AS sala_nombre,
+        sr.equipo_ganador,
+        sr.finalizada_en AS fecha
+      FROM salas_resultados sr
+      JOIN salas s ON s.id = sr.id_sala
+      JOIN sala_jugadores sj ON sj.id_sala = sr.id_sala AND sj.banda = sr.equipo_ganador
+      JOIN usuarios u ON u.id = sj.id_usuario
+      WHERE sr.finalizada_en >= NOW() - INTERVAL '7 days'
+      ORDER BY sr.finalizada_en DESC
+      LIMIT 10
+    `);
+
+    const sanciones = await db.query(`
+      SELECT
+        b.tipo AS tipo,
+        u.nombre_usuario,
+        u.avatar,
+        b.mensaje AS descripcion,
+        b.monto,
+        b.creado_en AS fecha
+      FROM bonos b
+      JOIN usuarios u ON u.id = b.usuario_id
+      WHERE b.tipo IN ('sancion', 'abono')
+        AND b.creado_en >= NOW() - INTERVAL '7 days'
+      ORDER BY b.creado_en DESC
+      LIMIT 15
+    `);
+
+    const actividad = [
+      ...ganadores.rows,
+      ...sanciones.rows
+    ].sort((a, b) => new Date(b.fecha) - new Date(a.fecha)).slice(0, 15);
+
+    res.json({ actividad });
+  } catch (e) {
+    console.error('[actividad-reciente]', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -302,7 +440,9 @@ router.get('/chat-general', async (req, res) => {
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 10), 100) : 40;
 
     const r = await db.query(
-      `SELECT m.id, m.mensaje, m.creado_en, u.nombre_usuario, u.avatar, u.nivel
+      `SELECT m.id, m.mensaje, m.creado_en, m.id_usuario,
+              COALESCE(m.tipo, 'texto') AS tipo, m.sticker_id,
+              u.nombre_usuario, u.avatar, u.nivel
        FROM mensajes_chat_general m
        LEFT JOIN usuarios u ON u.id = m.id_usuario
        WHERE ($1::int IS NULL OR m.id < $1)
@@ -315,6 +455,21 @@ router.get('/chat-general', async (req, res) => {
     const cursor = mensajes.length ? mensajes[0].id : null;
     const hasMore = r.rows.length === limit;
     res.json({ mensajes, cursor, hasMore });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Verificar si usuario es premium (saldo >= 1000) y obtener lista de stickers
+router.get('/stickers/estado', verificarToken, async (req, res) => {
+  try {
+    const r = await db.query('SELECT saldo FROM usuarios WHERE id=$1', [req.usuario.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const saldo = parseFloat(r.rows[0].saldo);
+    const esPremium = saldo >= 1000;
+    const totalStickers = 90;
+    const stickers = esPremium ? Array.from({ length: totalStickers }, (_, i) => i + 1) : [];
+    res.json({ esPremium, saldo, totalStickers, stickers });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -341,12 +496,28 @@ router.get('/:id/chat', async (req, res) => {
 
 router.get('/chat-privado/:idAmigo', verificarToken, async (req, res) => {
   try {
+    const limit = Math.min(parseInt(req.query.limit) || 40, 100);
+    const before = req.query.before ? parseInt(req.query.before) : null;
+    const params = [req.usuario.id, req.params.idAmigo];
+    let whereBefore = '';
+    if (before) {
+      whereBefore = ` AND m.id < $3`;
+      params.push(before);
+    }
     const r = await db.query(
-      'SELECT m.*, u.nombre_usuario AS emisor_nombre, u.avatar AS emisor_avatar FROM mensajes_chat_privado m JOIN usuarios u ON u.id=m.id_emisor WHERE (m.id_emisor=$1 AND m.id_receptor=$2) OR (m.id_emisor=$2 AND m.id_receptor=$1) ORDER BY m.creado_en ASC LIMIT 100',
-      [req.usuario.id, req.params.idAmigo]
+      `SELECT m.*, u.nombre_usuario AS emisor_nombre, u.avatar AS emisor_avatar
+       FROM mensajes_chat_privado m
+       JOIN usuarios u ON u.id=m.id_emisor
+       WHERE ((m.id_emisor=$1 AND m.id_receptor=$2) OR (m.id_emisor=$2 AND m.id_receptor=$1))${whereBefore}
+       ORDER BY m.id DESC LIMIT ${limit + 1}`,
+      params
     );
+    const rows = r.rows;
+    const hasMore = rows.length > limit;
+    const mensajes = rows.slice(0, limit).reverse();
+    const cursor = mensajes.length > 0 ? mensajes[0].id : null;
     await db.query('UPDATE mensajes_chat_privado SET leido=TRUE WHERE id_receptor=$1 AND id_emisor=$2', [req.usuario.id, req.params.idAmigo]);
-    res.json({ mensajes: r.rows });
+    res.json({ mensajes, cursor, hasMore });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -380,7 +551,8 @@ router.get('/:id', async (req, res) => {
             'mmr', COALESCE(uj.mmr, 0),
             'banda', sj.banda,
             'equipo', sj.equipo,
-            'listo', sj.listo
+            'listo', sj.listo,
+            'unido_en', sj.unido_en
           ) ORDER BY sj.unido_en
         ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info
       FROM salas s
@@ -430,6 +602,12 @@ router.post('/:id/listo', verificarToken, async (req, res) => {
           nombreSala: sala.nombre,
           totalJugadores: total,
         });
+
+        if (sala.es_automatico) {
+          // Nota: El superadmin debe ingresar el lobby_id manualmente
+          // El sistema ya no crea lobbies automáticamente en Steam
+          console.log(`[SALA] Sala #${idSala} lista. Superadmin debe ingresar lobby_id manualmente.`);
+        }
       }
     }
     socketEmitter.emitirActualizacionSalaSimple(Number(idSala));

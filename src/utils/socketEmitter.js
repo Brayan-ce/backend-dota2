@@ -51,4 +51,42 @@ module.exports = {
     _io.emit('admin:sala:todos-listos', payload);
     _io.to(`sala:${idSala}`).emit('sala:todos-listos', payload);
   },
+
+  // ── Eventos de lobby automático de Dota 2 ────────────────────────────
+
+  // El bot Steam creó el lobby — envía lobby_id y password a los jugadores de la sala
+  emitirLobbyCreado(idSala, payload) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('lobby:creado', payload);
+    _io.emit('admin:lobby:creado', payload);
+  },
+
+  // Se envió invitación dentro de Dota 2 a un jugador
+  emitirJugadorInvitado(idSala, payload) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('lobby:jugador-invitado', payload);
+    if (payload.idUsuario) {
+      _io.to(`usuario:${payload.idUsuario}`).emit('lobby:invitacion-recibida', payload);
+    }
+  },
+
+  // Actualización en tiempo real del estado del lobby (jugadores que se unen)
+  emitirLobbyActualizado(idSala, payload) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('lobby:actualizado', payload);
+  },
+
+  // Cambio de estado del lobby: 'creando' | 'creado' | 'jugadores_unidos' | 'iniciado' | 'error'
+  emitirLobbyEstado(idSala, payload) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('lobby:estado', payload);
+    _io.emit('admin:lobby:estado', payload);
+  },
+
+  // Error al crear o gestionar el lobby
+  emitirLobbyError(idSala, payload) {
+    if (!_io) return;
+    _io.to(`sala:${idSala}`).emit('lobby:error', payload);
+    _io.emit('admin:lobby:error', payload);
+  },
 };

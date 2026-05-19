@@ -38,5 +38,12 @@
   "devDependencies": {
     "concurrently": "^9.2.1",
     "nodemon": "^3.1.14"
+  },
+  "overrides": {
+    "steam": {
+      "steam-resources": {
+        "protobufjs": "3.8.2"
+      }
+    }
   }
 }

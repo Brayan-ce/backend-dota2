@@ -369,11 +369,11 @@ class ApuestaService {
       )
       SELECT
         id_sala,
-        COUNT(DISTINCT id_usuario) FILTER (WHERE lado = 'radiant') AS radiant_votos,
-        COUNT(DISTINCT id_usuario) FILTER (WHERE lado = 'dire') AS dire_votos,
+        COUNT(*) FILTER (WHERE lado = 'radiant') AS radiant_votos,
+        COUNT(*) FILTER (WHERE lado = 'dire') AS dire_votos,
         COALESCE(SUM(monto) FILTER (WHERE lado = 'radiant'), 0) AS radiant_monto,
         COALESCE(SUM(monto) FILTER (WHERE lado = 'dire'), 0) AS dire_monto,
-        COUNT(DISTINCT id_usuario) FILTER (WHERE lado = 'jugador') AS jugador_votos
+        COUNT(*) FILTER (WHERE lado = 'jugador') AS jugador_votos
       FROM base
       GROUP BY id_sala
     `;

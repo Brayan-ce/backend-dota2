@@ -72,6 +72,16 @@ app.use('/api/ganadores', ganadoresRoutes);
 app.use('/api/partidas-en-vivo', partidasVivoRoutes);
 app.use('/api/superadmin', superadminRoutes);
 
+// Configuración pública (bot Steam ID para que usuarios puedan agregarlo)
+app.get('/api/config', (req, res) => {
+  res.json({
+    botSteamId: process.env.BOT_STEAM_ID || null,
+    botSteamProfileUrl: process.env.BOT_STEAM_ID
+      ? `https://steamcommunity.com/profiles/${process.env.BOT_STEAM_ID}`
+      : null,
+  });
+});
+
 // Ruta de salud
 app.get('/api/health', (req, res) => {
   res.json({
