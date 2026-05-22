@@ -1,17 +1,5 @@
 const Redis = require('ioredis');
 
-const mockRedis = {
-  get: async () => null,
-  set: async () => 'OK',
-  setex: async () => 'OK',
-  del: async () => 1,
-  publish: async () => 1,
-  duplicate: () => mockRedis,
-  subscribe: async () => {},
-  on: () => mockRedis,
-  status: 'mock',
-};
-
 let redis;
 
 try {
@@ -19,27 +7,31 @@ try {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT) || 6379,
     password: process.env.REDIS_PASSWORD || undefined,
-    maxRetriesPerRequest: 0,
-    lazyConnect: true,
-    connectTimeout: 2000,
-    retryStrategy: () => null, // No reintentar — usar mock si falla
+    maxRetriesPerRequest: 3,
+    lazyConnect: false,
+    connectTimeout: 5000,
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 50, 2000);
+      return delay;
+    },
   });
 
   client.on('connect', () => {
-    console.log('🔴 Conectado a Redis');
+    console.log('🔴 Redis conectado');
+  });
+
+  client.on('ready', () => {
+    console.log('🔴 Redis listo para comandos');
   });
 
   client.on('error', (err) => {
-    // Solo loguear una vez, no spamear
-    if (client.status !== 'end') {
-      console.log('⚠️ Redis no disponible, usando mock en memoria:', err.code || err.message);
-    }
+    console.error('⚠️ Redis error:', err.message);
   });
 
   redis = client;
 } catch (error) {
-  console.log('⚠️ Redis no disponible, funcionando sin caché');
-  redis = mockRedis;
+  console.error('⚠️ Error inicializando Redis:', error.message);
+  throw error;
 }
 
 module.exports = redis;

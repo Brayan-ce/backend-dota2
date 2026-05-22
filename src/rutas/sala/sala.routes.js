@@ -7,10 +7,24 @@ const socketEmitter = require('../../utils/socketEmitter');
 
 router.get('/', async (req, res) => {
   try {
+    const { filtro } = req.query;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const offset = parseInt(req.query.offset) || 0;
+    if (filtro === 'finalizadas') {
+      const { salas, total } = await Sala.listarFinalizadas(limit, offset);
+      const activas = await Sala.contarActivas();
+      return res.json({ salas, activas, finalizadas: total, hasMore: offset + salas.length < total });
+    }
+    if (filtro === 'canceladas') {
+      const { salas, total } = await Sala.listarCanceladas(limit, offset);
+      const activas = await Sala.contarActivas();
+      return res.json({ salas, activas, canceladas: total, hasMore: offset + salas.length < total });
+    }
     const salas = await Sala.listar();
     const activas = await Sala.contarActivas();
-    const terminadas = await Sala.contarTerminadas();
-    res.json({ salas, activas, terminadas });
+    const finalizadas = await Sala.contarFinalizadas();
+    const canceladas = await Sala.contarCanceladas();
+    res.json({ salas, activas, terminadas: finalizadas, finalizadas, canceladas });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -330,31 +344,7 @@ router.post('/:id/salir', verificarToken, async (req, res) => {
 
     await client.query('DELETE FROM sala_jugadores WHERE id_sala=$1 AND id_usuario=$2', [sala.id, req.usuario.id]);
 
-    // Verificar si es modo 1v1 y el sorteo ya se hizo (hay bando asignado)
-    const es1v1 = parseInt(sala.max_jugadores) === 2;
-    const sorteoHecho = await client.query(
-      'SELECT banda FROM sala_jugadores WHERE id_sala=$1 AND id_usuario=$2 AND sorteado=TRUE',
-      [sala.id, req.usuario.id]
-    );
-
-    let sancionAplicada = false;
-    if (es1v1 && sorteoHecho.rows.length > 0) {
-      // En 1v1, el sorteo determina dos CAPITANES (Radiant y Dire)
-      // La sanción de -5 aplica a CUALQUIERA que salga después del sorteo
-      await client.query('UPDATE usuarios SET saldo = saldo - 5 WHERE id = $1', [req.usuario.id]);
-      await client.query(
-        `INSERT INTO transacciones (id_usuario, tipo, monto, descripcion, creado_en)
-         VALUES ($1, 'sancion', -5, $2, NOW())`,
-        [req.usuario.id, `Sanción -5 al CAPITÁN por abandonar sala 1v1 #${sala.id}`]
-      );
-      sancionAplicada = true;
-
-      // Marcar la sala para que el siguiente entre sin sorteo (guardar banda del capitán que se salió)
-      await client.query(
-        'UPDATE salas SET banda_vacante=$1, sorteo_pendiente=FALSE WHERE id=$2',
-        [sorteoHecho.rows[0].banda, sala.id]
-      );
-    }
+    const sancionAplicada = false;
 
     const updated = await client.query(
       'UPDATE salas SET jugadores_actuales=(SELECT COUNT(*) FROM sala_jugadores WHERE id_sala=$1), actualizada_en=NOW() WHERE id=$1 RETURNING *',
@@ -433,6 +423,19 @@ router.get('/actividad-reciente', async (req, res) => {
   }
 });
 
+// Obtener salas terminadas donde el usuario participó
+router.get('/mis-terminadas', verificarToken, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const offset = parseInt(req.query.offset) || 0;
+    const { salas, total } = await Sala.listarTerminadasPorUsuario(req.usuario.id, limit, offset);
+    res.json({ salas, total, hasMore: offset + salas.length < total });
+  } catch (e) {
+    console.error('[mis-terminadas]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/chat-general', async (req, res) => {
   try {
     const before = req.query.before ? parseInt(req.query.before, 10) : null;
@@ -442,7 +445,7 @@ router.get('/chat-general', async (req, res) => {
     const r = await db.query(
       `SELECT m.id, m.mensaje, m.creado_en, m.id_usuario,
               COALESCE(m.tipo, 'texto') AS tipo, m.sticker_id,
-              u.nombre_usuario, u.avatar, u.nivel
+              u.nombre_usuario, u.avatar, u.nivel, u.saldo
        FROM mensajes_chat_general m
        LEFT JOIN usuarios u ON u.id = m.id_usuario
        WHERE ($1::int IS NULL OR m.id < $1)
@@ -475,12 +478,150 @@ router.get('/stickers/estado', verificarToken, async (req, res) => {
   }
 });
 
+// Verificar estado premium para cambio de nombre (una vez al mes)
+router.get('/premium/nombre-estado', verificarToken, async (req, res) => {
+  try {
+    const r = await db.query(
+      'SELECT saldo, nombre_usuario, nombre_cambiado_en FROM usuarios WHERE id=$1',
+      [req.usuario.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    
+    const saldo = parseFloat(r.rows[0].saldo);
+    const esPremium = saldo >= 1000;
+    const nombre = r.rows[0].nombre_usuario;
+    const ultimoCambio = r.rows[0].nombre_cambiado_en;
+    
+    // Calcular días restantes para próximo cambio
+    let diasRestantes = 0;
+    let puedeCambiar = esPremium;
+    
+    if (ultimoCambio) {
+      const ultimaFecha = new Date(ultimoCambio);
+      const ahora = new Date();
+      const diffMs = ahora - ultimaFecha;
+      const diffDias = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      
+      if (diffDias < 30) {
+        diasRestantes = 30 - diffDias;
+        puedeCambiar = false;
+      }
+    }
+    
+    res.json({ 
+      esPremium, 
+      saldo, 
+      nombre,
+      puedeCambiar,
+      diasRestantes,
+      ultimoCambio 
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Cambiar nombre de usuario (solo premium, máximo 1 vez al mes)
+router.post('/premium/cambiar-nombre', verificarToken, async (req, res) => {
+  try {
+    const { nuevoNombre } = req.body;
+    
+    // Validaciones
+    if (!nuevoNombre || typeof nuevoNombre !== 'string') {
+      return res.status(400).json({ error: 'Nombre requerido' });
+    }
+    
+    const nombreLimpio = nuevoNombre.trim();
+    if (nombreLimpio.length < 3 || nombreLimpio.length > 20) {
+      return res.status(400).json({ error: 'El nombre debe tener entre 3 y 20 caracteres' });
+    }
+    
+    // Validar caracteres alfanuméricos
+    if (!/^[a-zA-Z0-9_-]+$/.test(nombreLimpio)) {
+      return res.status(400).json({ error: 'El nombre solo puede contener letras, números, guiones y guiones bajos' });
+    }
+    
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+      
+      // Verificar premium y último cambio
+      const r = await client.query(
+        'SELECT saldo, nombre_cambiado_en FROM usuarios WHERE id=$1 FOR UPDATE',
+        [req.usuario.id]
+      );
+      
+      if (!r.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+      }
+      
+      const saldo = parseFloat(r.rows[0].saldo);
+      const esPremium = saldo >= 1000;
+      const ultimoCambio = r.rows[0].nombre_cambiado_en;
+      
+      if (!esPremium) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'Necesitas S/ 1,000.00 o más para cambiar tu nombre' });
+      }
+      
+      // Verificar cooldown de 30 días
+      if (ultimoCambio) {
+        const ultimaFecha = new Date(ultimoCambio);
+        const ahora = new Date();
+        const diffMs = ahora - ultimaFecha;
+        const diffDias = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        
+        if (diffDias < 30) {
+          const diasRestantes = 30 - diffDias;
+          await client.query('ROLLBACK');
+          return res.status(429).json({ 
+            error: `Debes esperar ${diasRestantes} día${diasRestantes > 1 ? 's' : ''} más para cambiar tu nombre` 
+          });
+        }
+      }
+      
+      // Verificar que el nombre no esté en uso
+      const existe = await client.query(
+        'SELECT id FROM usuarios WHERE nombre_usuario = $1 AND id != $2',
+        [nombreLimpio, req.usuario.id]
+      );
+      
+      if (existe.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Este nombre ya está en uso' });
+      }
+      
+      // Actualizar nombre y fecha de cambio
+      await client.query(
+        'UPDATE usuarios SET nombre_usuario = $1, nombre_cambiado_en = NOW() WHERE id = $2',
+        [nombreLimpio, req.usuario.id]
+      );
+      
+      await client.query('COMMIT');
+      
+      res.json({ 
+        success: true, 
+        mensaje: 'Nombre cambiado exitosamente',
+        nuevoNombre: nombreLimpio 
+      });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Historial del chat de sala (público para leer, solo participantes pueden escribir vía socket)
 router.get('/:id/chat', async (req, res) => {
   try {
     const r = await db.query(
       `SELECT m.id, m.mensaje, m.creado_en, m.id_usuario,
-              u.nombre_usuario, u.avatar
+              u.nombre_usuario, u.avatar, u.saldo
        FROM mensajes_chat_sala m
        JOIN usuarios u ON u.id = m.id_usuario
        WHERE m.id_sala = $1
@@ -549,10 +690,26 @@ router.get('/:id', async (req, res) => {
             'nombre', uj.nombre_usuario,
             'avatar', uj.avatar,
             'mmr', COALESCE(uj.mmr, 0),
+            'saldo', uj.saldo,
             'banda', sj.banda,
             'equipo', sj.equipo,
             'listo', sj.listo,
-            'unido_en', sj.unido_en
+            'unido_en', sj.unido_en,
+            'salas_jugadas', (
+              SELECT COUNT(*) FROM sala_jugadores sj2
+              JOIN salas s2 ON s2.id = sj2.id_sala
+              WHERE sj2.id_usuario = uj.id
+                AND s2.estado IN ('finalizada','terminada')
+                AND s2.match_resultado IS NOT NULL
+            ),
+            'salas_ganadas', (
+              SELECT COUNT(*) FROM sala_jugadores sj3
+              JOIN salas s3 ON s3.id = sj3.id_sala
+              WHERE sj3.id_usuario = uj.id
+                AND s3.estado IN ('finalizada','terminada')
+                AND s3.match_resultado IS NOT NULL
+                AND s3.match_resultado->>'winner' = sj3.banda
+            )
           ) ORDER BY sj.unido_en
         ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info
       FROM salas s

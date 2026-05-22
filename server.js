@@ -8,7 +8,7 @@ const SocketHandler = require('./src/websocket/socketHandler');
 const { manejarError, rutaNoEncontrada } = require('./src/utils/errores');
 
 // Importar rutas
-const { authRoutes, apuestaRoutes, partidaRoutes, salaRoutes, amigoRoutes, billeteraRoutes, configuracionRoutes, recargaRoutes, referidosRoutes, retiroRoutes, apuestasRoutes, bonosRoutes, guiasRoutes, baneadosRoutes, ganadoresRoutes, partidasVivoRoutes, superadminRoutes } = require('./src/rutas');
+const { authRoutes, apuestaRoutes, partidaRoutes, salaRoutes, amigoRoutes, billeteraRoutes, configuracionRoutes, recargaRoutes, referidosRoutes, retiroRoutes, apuestasRoutes, bonosRoutes, guiasRoutes, baneadosRoutes, ganadoresRoutes, partidasVivoRoutes, superadminRoutes, soporteRoutes } = require('./src/rutas');
 
 // Crear aplicación Express
 const app = express();
@@ -71,6 +71,7 @@ app.use('/api/baneados', baneadosRoutes);
 app.use('/api/ganadores', ganadoresRoutes);
 app.use('/api/partidas-en-vivo', partidasVivoRoutes);
 app.use('/api/superadmin', superadminRoutes);
+app.use('/api/soporte', soporteRoutes);
 
 // Configuración pública (bot Steam ID para que usuarios puedan agregarlo)
 app.get('/api/config', (req, res) => {

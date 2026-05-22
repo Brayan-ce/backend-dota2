@@ -604,10 +604,18 @@ router.post('/salas', verificarSuperadminToken, async (req, res) => {
 router.get('/salas', verificarSuperadminToken, async (req, res) => {
   try {
     const { estado } = req.query; // opcional: 'esperando','jugando','terminada','cancelada'
-    const filtro = estado
-      ? `WHERE s.estado = $1`
-      : `WHERE s.estado IN ('esperando','jugando','terminada','cancelada')`;
-    const params = estado ? [estado] : [];
+    let filtro;
+    let params = [];
+    
+    if (estado === 'jugando') {
+      // Incluir tanto 'jugando' como 'en_progreso'
+      filtro = `WHERE s.estado IN ('jugando', 'en_progreso')`;
+    } else if (estado) {
+      filtro = `WHERE s.estado = $1`;
+      params = [estado];
+    } else {
+      filtro = `WHERE s.estado IN ('esperando','jugando','terminada','finalizada','cancelada','en_progreso')`;
+    }
 
     const r = await db.query(`
       SELECT s.*,
@@ -671,11 +679,12 @@ router.get('/salas/:id', verificarSuperadminToken, async (req, res) => {
             'id',     uj.id,
             'nombre', uj.nombre_usuario,
             'avatar', uj.avatar,
+            'steam_id', uj.steam_id,
             'mmr',    COALESCE(uj.mmr, 0),
             'banda',  sj.banda,
             'equipo', sj.equipo
           ) ORDER BY sj.unido_en
-        ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info
+        ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores
       FROM salas s
       LEFT JOIN usuarios       u  ON u.id = s.id_creador
       LEFT JOIN LATERAL (
@@ -694,6 +703,7 @@ router.get('/salas/:id', verificarSuperadminToken, async (req, res) => {
     );
 
     if (!r.rows.length) return res.status(404).json({ error: 'Sala no encontrada' });
+    console.log(`[DEBUG API] Sala ${id} - match_id: ${r.rows[0].match_id}, lobby_id: ${r.rows[0].lobby_id}`);
     return res.json({ sala: r.rows[0] });
   } catch (error) {
     console.error('Error obteniendo sala admin:', error);
@@ -924,7 +934,9 @@ router.post('/salas/:id/iniciar', verificarSuperadminToken, async (req, res) => 
     const jugadores = jugadoresQuery.rows.map(j => ({
       steamId: j.steam_id,
       name: j.nombre_usuario,
-      team: j.equipo === 'dire' ? 1 : 0 // 0 = Radiant, 1 = Dire
+      team: j.equipo === 'dire' ? 1 : 0, // 0 = Radiant, 1 = Dire
+      banda: j.equipo || 'radiant', // "radiant" o "dire"
+      esCapitan: false // TODO: determinar por lógica de capitanes
     }));
     
     // Generar contraseña aleatoria para el lobby
@@ -932,45 +944,80 @@ router.post('/salas/:id/iniciar', verificarSuperadminToken, async (req, res) => 
     
     socketEmitter.emitirActualizacionSalaAdmin(salaActualizada);
 
-    // Crear lobby en Dota 2 automáticamente mediante el bot C#
+    // Crear lobby en Dota 2 automáticamente mediante el bot Go
     // Usamos setImmediate para no bloquear la respuesta HTTP
     setImmediate(async () => {
       let updateClient;
       try {
-        const dotaBotService = require('../../servicios/dota-bot/dotaBot.service');
+        const dotaBotService = require('../../servicios/dota-bot/dotaBotGo.service');
         
         console.log(`[SALA] Creando lobby automático para sala #${id} con ${jugadores.length} jugadores...`);
         
         // Llamar al bot C# para crear el lobby
+        const maxJugadores = salaActualizada.max_jugadores || 10;
+        const gameMode = maxJugadores <= 2 ? 21 : 1; // 21 = 1v1 Solo Mid, 1 = All Pick
+        
+        console.log(`[SALA] Configurando lobby: ${maxJugadores} jugadores, modo ${gameMode}`);
+        
         const botResponse = await dotaBotService.createLobby({
-          salaId: id,
-          nombre: tituloFinal,
-          password: lobbyPassword,
-          gameMode: 1, // All Pick
-          jugadores: jugadores
+          salaId:       id,
+          nombre:       tituloFinal,
+          password:     lobbyPassword,
+          gameMode:     gameMode,
+          region:       7,  // South America
+          maxJugadores: maxJugadores,
+          jugadores:    jugadores
         });
         
         if (botResponse.success) {
           console.log(`[SALA] Lobby creado automáticamente: ${botResponse.lobbyId}`);
           
-          // Actualizar sala con el lobby ID (nueva conexión)
+          // Actualizar sala con lobby_id, lobby_password y lobby_nombre
           updateClient = await db.pool.connect();
-          await updateClient.query(
-            'UPDATE salas SET lobby_id = $1, lobby_estado = $2 WHERE id = $3',
-            [botResponse.lobbyId, 'creado', id]
+          console.log(`[SALA] Guardando lobby en DB: id=${id}, lobbyId=${String(botResponse.lobbyId)}, password=${lobbyPassword}, nombre=${tituloFinal}`);
+          const updateResult = await updateClient.query(
+            'UPDATE salas SET lobby_id = $1, lobby_password = $2, lobby_nombre = $3, lobby_estado = $4 WHERE id = $5 RETURNING lobby_id, lobby_password',
+            [String(botResponse.lobbyId), lobbyPassword, tituloFinal, 'creado', id]
           );
+          console.log(`[SALA] DB actualizada:`, updateResult.rows[0]);
           
-          // Notificar a jugadores via socket
-          socketEmitter.emitirLobbyCreado(id, {
-            idSala: id,
-            lobbyId: botResponse.lobbyId,
-            lobbyPassword: botResponse.password,
-            mensaje: `¡Lobby creado! ID: ${botResponse.lobbyId}${botResponse.password ? ` | Password: ${botResponse.password}` : ''}`
+          // Invitar a cada jugador con steam_id al lobby
+          let invitados = 0;
+          for (const j of jugadores) {
+            if (!j.steamId) continue;
+            try {
+              await dotaBotService.invitePlayer(j.steamId, botResponse.lobbyId);
+              invitados++;
+              console.log(`[SALA] Invitación enviada a ${j.name} (${j.steamId})`);
+              socketEmitter.emitirJugadorInvitado(Number(id), {
+                idSala:   Number(id),
+                steamId:  j.steamId,
+                nombre:   j.name,
+                mensaje:  `Invitación enviada a ${j.name} en Dota 2`
+              });
+            } catch (invErr) {
+              console.error(`[SALA] Error invitando ${j.steamId}:`, invErr.message);
+            }
+          }
+          
+          // Notificar a todos los jugadores via socket
+          const regionNombre = maxJugadores <= 2 ? 'Australia (1v1)' : 'Sudamérica (Perú)';
+          socketEmitter.emitirLobbyCreado(Number(id), {
+            idSala:        Number(id),
+            lobbyId:       String(botResponse.lobbyId),
+            lobbyNombre:   tituloFinal,
+            lobbyPassword: lobbyPassword,
+            region:        regionNombre,
+            mensaje:       `¡Lobby creado! Busca "${tituloFinal}" en Dota 2 — Pass: ${lobbyPassword} — Región: ${regionNombre}`
           });
           
-          console.log(`[SALA] Jugadores notificados del lobby ${botResponse.lobbyId}`);
+          console.log(`[SALA] Lobby ${botResponse.lobbyId} creado, ${invitados} jugadores invitados`);
         } else {
           console.error(`[SALA] Error creando lobby automático: ${botResponse.message}`);
+          socketEmitter.emitirLobbyError(Number(id), {
+            idSala: Number(id),
+            error:  botResponse.message || 'Error desconocido al crear lobby'
+          });
         }
       } catch (err) {
         console.error(`[SALA] Error en creación automática de lobby:`, err.message);
@@ -1053,6 +1100,54 @@ router.post('/salas/:id/lobby', verificarSuperadminToken, async (req, res) => {
   } catch (error) {
     console.error('Error al asignar lobby:', error);
     return res.status(500).json({ error: 'Error al asignar lobby' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// Eliminar sala completa
+router.delete('/salas/:id', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  let client;
+  try {
+    client = await db.pool.connect();
+    await client.query('BEGIN');
+
+    // Verificar sala existe
+    const salaR = await client.query('SELECT * FROM salas WHERE id=$1', [id]);
+    if (!salaR.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Sala no encontrada' });
+    }
+
+    // Devolver dinero a jugadores si hay entrada
+    const entrada = parseFloat(salaR.rows[0].entrada) || 0;
+    if (entrada > 0) {
+      const jugadoresR = await client.query('SELECT id_usuario FROM sala_jugadores WHERE id_sala=$1', [id]);
+      for (const jugador of jugadoresR.rows) {
+        await client.query('UPDATE usuarios SET saldo=saldo+$1 WHERE id=$2', [entrada, jugador.id_usuario]);
+        await client.query(
+          `INSERT INTO transacciones (id_usuario, tipo, monto, descripcion, creado_en) VALUES ($1,'devolucion',$2,$3,NOW())`,
+          [jugador.id_usuario, entrada, 'Eliminación de sala por admin']
+        );
+      }
+    }
+
+    // Eliminar mensajes de chat de la sala
+    await client.query('DELETE FROM mensajes_chat_sala WHERE id_sala=$1', [id]);
+    // Eliminar jugadores de la sala
+    await client.query('DELETE FROM sala_jugadores WHERE id_sala=$1', [id]);
+    // Eliminar apuestas asociadas (las de tipo sala se identifican por prediccion LIKE 'sala:id:%')
+    await client.query("DELETE FROM apuestas WHERE prediccion LIKE 'sala:' || $1 || ':%'", [id]);
+    // Eliminar la sala
+    await client.query('DELETE FROM salas WHERE id=$1', [id]);
+
+    await client.query('COMMIT');
+    return res.json({ ok: true, message: 'Sala eliminada correctamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error al eliminar sala:', error);
+    return res.status(500).json({ error: 'Error al eliminar sala' });
   } finally {
     if (client) client.release();
   }
@@ -2009,6 +2104,647 @@ router.post('/bonos', verificarSuperadminToken, async (req, res) => {
     if (error.code === 'SUPERADMIN_BONOS_SCHEMA_MISSING') return handleSchemaMissing(res, error);
     console.error('Error dando bono:', error);
     return res.status(500).json({ error: 'Error al dar bono' });
+  }
+});
+
+// === SOPORTE - Sistema de chat ===
+
+// Obtener lista de chats activos
+router.get('/soporte/chats', verificarSuperadminToken, async (req, res) => {
+  try {
+    // Chats de usuarios (tipo='usuario') y admins (tipo='admin')
+    const r = await db.query(`
+      SELECT 
+        c.id,
+        c.tipo,
+        c.usuario_id,
+        c.admin_id,
+        c.estado,
+        c.creado_en,
+        c.actualizado_en,
+        COALESCE(u.nombre_usuario, a.usuario) as nombre,
+        COALESCE(u.avatar, '/font/logo.png') as avatar,
+        (
+          SELECT LEFT(mensaje, 50) FROM soporte_mensajes 
+          WHERE chat_id = c.id 
+          ORDER BY creado_en DESC LIMIT 1
+        ) as ultimo_mensaje,
+        (
+          SELECT creado_en FROM soporte_mensajes 
+          WHERE chat_id = c.id 
+          ORDER BY creado_en DESC LIMIT 1
+        ) as ultima_actividad,
+        (
+          SELECT COUNT(*) FROM soporte_mensajes 
+          WHERE chat_id = c.id AND es_admin = false AND visto = false
+        ) > 0 as sin_responder
+      FROM soporte_chats c
+      LEFT JOIN usuarios u ON c.usuario_id = u.id
+      LEFT JOIN superadmin_usuarios a ON c.admin_id = a.id
+      ORDER BY 
+        CASE WHEN c.estado = 'activo' THEN 0 ELSE 1 END,
+        c.actualizado_en DESC
+    `);
+
+    res.json({ chats: r.rows });
+  } catch (e) {
+    console.error('Error obteniendo chats:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Obtener mensajes de un chat (con paginación)
+router.get('/soporte/chats/:id/mensajes', verificarSuperadminToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.id);
+    const limit = parseInt(req.query.limit) || 30;
+    const before = req.query.before; // ID del mensaje antes del cual cargar (para scroll up)
+
+    // Marcar mensajes como vistos
+    await db.query(
+      'UPDATE soporte_mensajes SET visto = true WHERE chat_id = $1 AND es_admin = false',
+      [chatId]
+    );
+
+    let query;
+    let params = [chatId, limit];
+    
+    if (before) {
+      // Cargar mensajes antes del ID dado (scroll up - mensajes más antiguos)
+      query = `
+        SELECT 
+          m.id,
+          m.mensaje,
+          m.es_admin,
+          m.creado_en as fecha,
+          COALESCE(u.nombre_usuario, a.usuario, 'Sistema') as autor
+        FROM soporte_mensajes m
+        LEFT JOIN usuarios u ON m.usuario_id = u.id
+        LEFT JOIN superadmin_usuarios a ON m.admin_id = a.id
+        WHERE m.chat_id = $1 AND m.id < $3
+        ORDER BY m.creado_en DESC
+        LIMIT $2
+      `;
+      params.push(parseInt(before));
+    } else {
+      // Cargar últimos mensajes (inicial o refresh)
+      query = `
+        SELECT * FROM (
+          SELECT 
+            m.id,
+            m.mensaje,
+            m.es_admin,
+            m.creado_en as fecha,
+            COALESCE(u.nombre_usuario, a.usuario, 'Sistema') as autor
+          FROM soporte_mensajes m
+          LEFT JOIN usuarios u ON m.usuario_id = u.id
+          LEFT JOIN superadmin_usuarios a ON m.admin_id = a.id
+          WHERE m.chat_id = $1
+          ORDER BY m.creado_en DESC
+          LIMIT $2
+        ) sub
+        ORDER BY sub.fecha ASC
+      `;
+    }
+
+    const r = await db.query(query, params);
+    
+    // Obtener total de mensajes para saber si hay más
+    const countRes = await db.query(
+      'SELECT COUNT(*) as total FROM soporte_mensajes WHERE chat_id = $1',
+      [chatId]
+    );
+
+    res.json({ 
+      mensajes: r.rows, 
+      hasMore: r.rows.length === limit,
+      total: parseInt(countRes.rows[0].total)
+    });
+  } catch (e) {
+    console.error('Error obteniendo mensajes:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Enviar mensaje
+router.post('/soporte/chats/:id/mensajes', verificarSuperadminToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.id);
+    const { mensaje } = req.body;
+    const adminId = req.superadmin.id;
+
+    if (!mensaje || !mensaje.trim()) {
+      return res.status(400).json({ error: 'Mensaje requerido' });
+    }
+
+    // Insertar mensaje
+    await db.query(
+      `INSERT INTO soporte_mensajes (chat_id, admin_id, mensaje, es_admin, visto) 
+       VALUES ($1, $2, $3, true, true)`,
+      [chatId, adminId, mensaje.trim()]
+    );
+
+    // Actualizar chat
+    await db.query(
+      'UPDATE soporte_chats SET actualizado_en = NOW() WHERE id = $1',
+      [chatId]
+    );
+
+    // Obtener mensajes actualizados
+    const r = await db.query(`
+      SELECT 
+        m.id,
+        m.mensaje,
+        m.es_admin,
+        m.creado_en as fecha,
+        COALESCE(u.nombre_usuario, a.usuario, 'Sistema') as autor
+      FROM soporte_mensajes m
+      LEFT JOIN usuarios u ON m.usuario_id = u.id
+      LEFT JOIN superadmin_usuarios a ON m.admin_id = a.id
+      WHERE m.chat_id = $1
+      ORDER BY m.creado_en ASC
+    `, [chatId]);
+
+    res.json({ mensajes: r.rows });
+  } catch (e) {
+    console.error('Error enviando mensaje:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Marcar chat como resuelto
+router.post('/soporte/chats/:id/resolver', verificarSuperadminToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.id);
+    const adminId = req.superadmin.id;
+
+    // Obtener nombre del admin
+    const adminRes = await db.query('SELECT usuario FROM superadmin_usuarios WHERE id = $1', [adminId]);
+    const adminNombre = adminRes.rows[0]?.usuario || 'Admin';
+
+    await db.query(
+      'UPDATE soporte_chats SET estado = $1, actualizado_en = NOW(), admin_id = $2 WHERE id = $3',
+      ['resuelto', adminId, chatId]
+    );
+
+    // Agregar mensaje de sistema especial
+    await db.query(
+      `INSERT INTO soporte_mensajes (chat_id, admin_id, mensaje, es_admin, visto, es_sistema) 
+       VALUES ($1, $2, $3, true, true, true)`,
+      [chatId, adminId, `✅ Chat marcado como resuelto por ${adminNombre}`]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Error resolviendo chat:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// Cerrar/Destruir lobby Dota 2
+// ─────────────────────────────────────────
+
+router.post('/salas/:id/cerrar-lobby', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  let client;
+  try {
+    const dotaBotService = require('../../servicios/dota-bot/dotaBot.service');
+    
+    // Obtener datos de la sala
+    client = await db.pool.connect();
+    const salaR = await client.query(
+      'SELECT id, lobby_id, lobby_nombre, nombre FROM salas WHERE id = $1',
+      [id]
+    );
+    
+    if (!salaR.rows.length) {
+      return res.status(404).json({ error: 'Sala no encontrada' });
+    }
+    
+    const sala = salaR.rows[0];
+    
+    if (!sala.lobby_id) {
+      return res.status(400).json({ error: 'Esta sala no tiene un lobby activo en Dota 2' });
+    }
+    
+    // Llamar al bot para que abandone el lobby
+    console.log(`[SUPERADMIN] Cerrando lobby ${sala.lobby_id} para sala #${id}`);
+    const result = await dotaBotService.leaveLobby(sala.lobby_id);
+    
+    if (!result.success) {
+      console.error(`[SUPERADMIN] Error cerrando lobby:`, result.message);
+      // Continuamos igual para limpiar la DB, pero avisamos
+    }
+    
+    // Limpiar datos del lobby en la base de datos
+    await client.query(
+      `UPDATE salas SET lobby_id = NULL, lobby_password = NULL, lobby_nombre = NULL, lobby_estado = 'sin_lobby', actualizada_en = NOW() WHERE id = $1`,
+      [id]
+    );
+    
+    // Notificar a los jugadores que el lobby fue cerrado
+    socketEmitter.emitirLobbyEstado(Number(id), {
+      idSala: Number(id),
+      estado: 'lobby_cerrado',
+      mensaje: `El lobby "${sala.lobby_nombre || sala.nombre}" fue cerrado por el administrador`
+    });
+    
+    res.json({ 
+      success: true, 
+      mensaje: `Lobby cerrado exitosamente`,
+      lobbyId: sala.lobby_id,
+      botResult: result
+    });
+    
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error en cerrar-lobby:`, error);
+    res.status(500).json({ error: 'Error al cerrar el lobby de Dota 2' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// ─────────────────────────────────────────
+// Obtener jugador host que quedó cuando el bot salió
+// ─────────────────────────────────────────
+
+router.get('/salas/:id/host-lobby', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const dotaBotGoService = require('../../servicios/dota-bot/dotaBotGo.service');
+    const host = dotaBotGoService.getHostPlayer(id);
+    
+    if (host) {
+      res.json({ 
+        success: true, 
+        host: host,
+        message: `Host asignado: ${host.name} (${host.steamId})`
+      });
+    } else {
+      res.json({ 
+        success: false, 
+        message: 'No hay información de host guardada para esta sala'
+      });
+    }
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error obteniendo host:`, error);
+    res.status(500).json({ error: 'Error al obtener información del host' });
+  }
+});
+
+// Iniciar partida en el lobby (lanzar el juego) via Redis
+router.post('/salas/:id/iniciar-partida', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const dotaBotGoService = require('../../servicios/dota-bot/dotaBotGo.service');
+    
+    // Obtener sala con datos del lobby
+    const salaRes = await db.query('SELECT * FROM salas WHERE id = $1', [id]);
+    const sala = salaRes.rows[0];
+    
+    if (!sala || !sala.lobby_id) {
+      return res.status(400).json({ error: 'No hay lobby activo para iniciar' });
+    }
+
+    // Llamar al bot Go via Redis para iniciar la partida
+    const result = await dotaBotGoService.iniciarPartida(id, sala.lobby_id);
+    
+    console.log(`[SUPERADMIN] Partida iniciada para sala ${id}, lobby ${sala.lobby_id}`);
+    res.json({ success: true, mensaje: 'Partida iniciada correctamente', result });
+    
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error en iniciar-partida:`, error);
+    res.status(500).json({ error: 'Error al iniciar la partida' });
+  }
+});
+
+// Hacer que el bot salga del slot (se queda como espectador) via Redis
+router.post('/salas/:id/salir-slot', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const dotaBotGoService = require('../../servicios/dota-bot/dotaBotGo.service');
+    
+    // Obtener sala con datos del lobby
+    const salaRes = await db.query('SELECT * FROM salas WHERE id = $1', [id]);
+    const sala = salaRes.rows[0];
+    
+    if (!sala || !sala.lobby_id) {
+      return res.status(400).json({ error: 'No hay lobby activo' });
+    }
+
+    // Llamar al bot Go via Redis para salir del slot
+    const result = await dotaBotGoService.salirSlot(id, sala.lobby_id);
+    
+    console.log(`[SUPERADMIN] Bot salió del slot en sala ${id}, lobby ${sala.lobby_id}`);
+    res.json({ success: true, mensaje: 'Bot movido a espectador correctamente', result });
+    
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error en salir-slot:`, error);
+    res.status(500).json({ error: 'Error al mover el bot a espectador' });
+  }
+});
+
+// Consultar resultado de partida via OpenDota API
+// Si la sala tiene match_id guardado, consulta directo. Si no, busca por jugadores.
+router.post('/salas/:id/consultar-resultado', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Obtener sala con jugadores y sus steam_ids
+    const salaQuery = await db.query(`
+      SELECT s.*, 
+             COALESCE(
+               json_agg(
+                 json_build_object(
+                   'usuario_id', sj.id_usuario,
+                   'steam_id', u.steam_id,
+                   'banda', sj.banda,
+                   'nombre', u.nombre_usuario,
+                   'mmr', u.mmr
+                 ) ORDER BY sj.id
+               ) FILTER (WHERE sj.id_usuario IS NOT NULL),
+               '[]'
+             ) as jugadores
+      FROM salas s
+      LEFT JOIN sala_jugadores sj ON s.id = sj.id_sala
+      LEFT JOIN usuarios u ON sj.id_usuario = u.id
+      WHERE s.id = $1
+      GROUP BY s.id
+    `, [id]);
+    
+    if (salaQuery.rows.length === 0) {
+      return res.status(404).json({ error: 'Sala no encontrada' });
+    }
+    
+    const sala = salaQuery.rows[0];
+    let matchEncontrado = null;
+    let matchIdUsado = null;
+    
+    // Variables de configuración de APIs
+    const steamApiKey = process.env.STEAM_API_KEY;
+    const stratzToken = process.env.STRATZ_TOKEN;
+    
+    // DEBUG: Verificar campos de la sala
+    console.log(`[SUPERADMIN] DEBUG Sala ${id} - lobby_id: ${sala.lobby_id}, match_id: ${sala.match_id}, match_encontrado_en: ${sala.match_encontrado_en}, match_resultado: ${sala.match_resultado}`);
+    
+    // OPCIÓN 1: Si ya tenemos match_id guardado, consultar directo
+    if (sala.match_id) {
+      console.log(`[SUPERADMIN] Sala ${id} tiene match_id guardado: ${sala.match_id}. Consultando...`);
+      matchIdUsado = sala.match_id;
+      
+      // === FUENTE 1: Steam Web API (oficial, inmediata, funciona con lobbies privados) ===
+      if (steamApiKey) {
+        try {
+          console.log(`[SUPERADMIN] Intentando Steam Web API...`);
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000); // 5 seg timeout
+          
+          const steamResponse = await fetch(
+            `https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/v1/?key=${steamApiKey}&match_id=${sala.match_id}`,
+            { signal: controller.signal }
+          );
+          clearTimeout(timeout);
+          
+          if (steamResponse.ok) {
+            const steamData = await steamResponse.json();
+            const match = steamData.result;
+            
+            // Steam API devuelve error en result.status si no encuentra la partida
+            if (match && match.error) {
+              console.warn(`[SUPERADMIN] Steam API error: ${match.error}`);
+            } else if (match && match.match_id) {
+              matchEncontrado = {
+                match_id: parseInt(sala.match_id),
+                radiant_win: match.radiant_win,
+                duration: match.duration,
+                start_time: match.start_time,
+                players: match.players || [],
+                radiant_score: match.radiant_score || 0,
+                dire_score: match.dire_score || 0,
+                game_mode: match.game_mode,
+                lobby_type: match.lobby_type,
+                region: match.cluster
+              };
+              console.log(`[SUPERADMIN] ✅ Match ${sala.match_id} encontrado en Steam Web API`);
+            }
+          } else {
+            const errorText = await steamResponse.text().catch(() => '');
+            console.warn(`[SUPERADMIN] Steam API status ${steamResponse.status}: ${errorText.substring(0, 100)}`);
+          }
+        } catch (steamErr) {
+          if (steamErr.name === 'AbortError') {
+            console.warn(`[SUPERADMIN] Steam API timeout (5s)`);
+          } else {
+            console.warn(`[SUPERADMIN] Error Steam API:`, steamErr.message);
+          }
+        }
+      } else {
+        console.warn(`[SUPERADMIN] STEAM_API_KEY no configurada, saltando Steam API...`);
+      }
+      
+      // === FUENTE 2: OpenDota (requiere solicitar parse primero para lobbies privados) ===
+      if (!matchEncontrado) {
+        try {
+          console.log(`[SUPERADMIN] Intentando OpenDota...`);
+          
+          // Paso 1: Solicitar parse de la partida (necesario para lobbies privados)
+          console.log(`[SUPERADMIN] Solicitando parse en OpenDota...`);
+          const parseController = new AbortController();
+          const parseTimeout = setTimeout(() => parseController.abort(), 3000);
+          await fetch(`https://api.opendota.com/api/request/${sala.match_id}`, {
+            method: 'POST',
+            signal: parseController.signal
+          }).catch(() => {}); // Ignorar error del parse
+          clearTimeout(parseTimeout);
+          
+          // Paso 2: Esperar brevemente y consultar con timeout
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          
+          const response = await fetch(`https://api.opendota.com/api/matches/${sala.match_id}`, {
+            signal: controller.signal
+          });
+          clearTimeout(timeout);
+          
+          if (response.ok) {
+            const matchData = await response.json();
+            matchEncontrado = {
+              match_id: parseInt(sala.match_id),
+              radiant_win: matchData.radiant_win,
+              duration: matchData.duration,
+              start_time: matchData.start_time,
+              players: matchData.players,
+              radiant_score: matchData.radiant_score,
+              dire_score: matchData.dire_score,
+              game_mode: matchData.game_mode,
+              lobby_type: matchData.lobby_type,
+              region: matchData.region
+            };
+            console.log(`[SUPERADMIN] ✅ Match ${sala.match_id} encontrado en OpenDota`);
+          } else {
+            console.warn(`[SUPERADMIN] OpenDota status ${response.status}`);
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            console.warn(`[SUPERADMIN] OpenDota timeout (5s)`);
+          } else {
+            console.warn(`[SUPERADMIN] Error OpenDota:`, err.message);
+          }
+        }
+      }
+      
+      // === FUENTE 3: STRATZ (requiere token) ===
+      if (!matchEncontrado && stratzToken) {
+        try {
+          console.log(`[SUPERADMIN] Intentando STRATZ API...`);
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          
+          const stratzResponse = await fetch(`https://api.stratz.com/api/v1/match/${sala.match_id}`, {
+            headers: {
+              'Authorization': `Bearer ${stratzToken}`,
+              'Accept': 'application/json'
+            },
+            signal: controller.signal
+          });
+          clearTimeout(timeout);
+          
+          if (stratzResponse.ok) {
+            const stratzData = await stratzResponse.json();
+            
+            if (stratzData.didRadiantWin !== undefined && stratzData.durationSeconds) {
+              matchEncontrado = {
+                match_id: parseInt(sala.match_id),
+                radiant_win: stratzData.didRadiantWin,
+                duration: stratzData.durationSeconds,
+                start_time: stratzData.startDateTime,
+                players: [],
+                radiant_score: stratzData.radiantKills || 0,
+                dire_score: stratzData.direKills || 0,
+                game_mode: stratzData.gameMode || 'Unknown',
+                lobby_type: stratzData.lobbyType || 'Unknown',
+                region: stratzData.regionId || 'Unknown'
+              };
+              console.log(`[SUPERADMIN] ✅ Match ${sala.match_id} encontrado en STRATZ`);
+            }
+          } else {
+            console.warn(`[SUPERADMIN] STRATZ status ${stratzResponse.status}`);
+          }
+        } catch (stratzErr) {
+          if (stratzErr.name === 'AbortError') {
+            console.warn(`[SUPERADMIN] STRATZ timeout (5s)`);
+          } else {
+            console.warn(`[SUPERADMIN] Error STRATZ:`, stratzErr.message);
+          }
+        }
+      }
+    }
+    
+    if (!matchEncontrado) {
+      return res.json({ 
+        success: false, 
+        message: sala.match_id 
+          ? `El match_id ${sala.match_id} no fue encontrado en Steam API, OpenDota ni STRATZ. Verifica que STEAM_API_KEY esté configurada en el backend.`
+          : 'No hay match_id guardado para esta sala.',
+        match_id_guardado: sala.match_id || null,
+        apis_intentadas: steamApiKey ? ['Steam API (falló)', 'OpenDota', 'STRATZ'] : ['Steam API (no configurada)', 'OpenDota', 'STRATZ']
+      });
+    }
+    
+    // Determinar ganador
+    // radiant_win = true -> ganó Radiant, false -> ganó Dire
+    const resultado = matchEncontrado.radiant_win ? 'radiant' : 'dire';
+    
+    // Guardar en base de datos (actualizar si ya existía, o guardar nuevo)
+    await db.query(`
+      UPDATE salas 
+      SET match_id = $1,
+          match_resultado = $2,
+          match_consultado_en = NOW(),
+          match_raw_data = $3,
+          estado = 'finalizada'
+      WHERE id = $4
+    `, [
+      String(matchEncontrado.match_id),
+      resultado,
+      JSON.stringify(matchEncontrado),
+      id
+    ]);
+    
+    console.log(`[SUPERADMIN] Resultado guardado para sala ${id}: ${resultado} (match ${matchEncontrado.match_id})`);
+    
+    res.json({
+      success: true,
+      match_id: matchEncontrado.match_id,
+      resultado: resultado,
+      duracion_segundos: matchEncontrado.duration,
+      duracion_formateada: `${Math.floor(matchEncontrado.duration / 60)}:${(matchEncontrado.duration % 60).toString().padStart(2, '0')}`,
+      fecha_inicio: new Date(matchEncontrado.start_time * 1000).toISOString(),
+      jugadores_encontrados: (sala.jugadores || []).filter(j => j.steam_id).length,
+      metodo_busqueda: sala.match_id && matchIdUsado === sala.match_id ? 'match_id_directo' : 'jugadores',
+      datos_completos: matchEncontrado
+    });
+    
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error consultando resultado:`, error);
+    res.status(500).json({ error: 'Error al consultar resultado de la partida', details: error.message });
+  }
+});
+
+// POST /api/superadmin/salas/:id/guardar-resultado - Guardar resultado manual
+router.post('/salas/:id/guardar-resultado', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { radiant_win, duration, radiant_score, dire_score, notas } = req.body;
+    
+    console.log(`[SUPERADMIN] Guardando resultado manual para sala ${id}:`, { radiant_win, duration, radiant_score, dire_score });
+    
+    // Validar datos requeridos
+    if (radiant_win === undefined || !duration) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Faltan datos requeridos: radiant_win (boolean) y duration (segundos)' 
+      });
+    }
+    
+    const db = require('../../config/database');
+    
+    // Guardar resultado en la sala
+    const resultado = {
+      radiant_win: Boolean(radiant_win),
+      duration: parseInt(duration),
+      radiant_score: parseInt(radiant_score) || 0,
+      dire_score: parseInt(dire_score) || 0,
+      notas: notas || 'Ingresado manualmente',
+      ingresado_en: new Date().toISOString()
+    };
+    
+    await db.query(
+      `UPDATE salas 
+       SET match_resultado = $1, 
+           match_encontrado_en = NOW()
+       WHERE id = $2`,
+      [JSON.stringify(resultado), id]
+    );
+    
+    console.log(`[SUPERADMIN] ✅ Resultado guardado manualmente para sala ${id}`);
+    
+    res.json({
+      success: true,
+      message: 'Resultado guardado correctamente',
+      resultado: {
+        ganador: radiant_win ? 'Radiant' : 'Dire',
+        duracion: `${Math.floor(duration / 60)}m ${duration % 60}s`,
+        score: `${radiant_score || 0} - ${dire_score || 0}`
+      }
+    });
+    
+  } catch (error) {
+    console.error(`[SUPERADMIN] Error guardando resultado manual:`, error);
+    res.status(500).json({ error: 'Error al guardar resultado', details: error.message });
   }
 });
 

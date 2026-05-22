@@ -79,14 +79,130 @@ class Sala {
     return r.rows[0];
   }
 
+  static async listarFinalizadas(limit = 20, offset = 0) {
+    const countR = await db.query(`SELECT COUNT(*) FROM salas WHERE estado = 'finalizada'`);
+    const total = parseInt(countR.rows[0].count);
+    const q = `
+      SELECT s.*, u.nombre_usuario AS creador_nombre, u.avatar AS creador_avatar,
+        COALESCE(json_agg(
+          json_build_object('id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario, 'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0))
+          ORDER BY sj.unido_en
+        ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info,
+        (
+          SELECT json_agg(json_build_object('id', uw.id, 'nombre', uw.nombre_usuario, 'avatar', uw.avatar))
+          FROM sala_jugadores sjw
+          JOIN usuarios uw ON uw.id = sjw.id_usuario
+          WHERE sjw.id_sala = s.id
+            AND sjw.banda = s.match_resultado->>'winner'
+        ) AS ganadores
+      FROM salas s
+      LEFT JOIN usuarios u ON u.id = s.id_creador
+      LEFT JOIN sala_jugadores sj ON sj.id_sala = s.id
+      LEFT JOIN usuarios uj ON uj.id = sj.id_usuario
+      WHERE s.estado = 'finalizada'
+      GROUP BY s.id, u.nombre_usuario, u.avatar
+      ORDER BY s.actualizada_en DESC
+      LIMIT $1 OFFSET $2
+    `;
+    const r = await db.query(q, [limit, offset]);
+    return { salas: r.rows, total };
+  }
+
+  static async contarFinalizadas() {
+    const r = await db.query("SELECT COUNT(*) FROM salas WHERE estado = 'finalizada'");
+    return parseInt(r.rows[0].count);
+  }
+
+  static async listarCanceladas(limit = 20, offset = 0) {
+    const countR = await db.query(`SELECT COUNT(*) FROM salas WHERE estado IN ('terminada','cancelada')`);
+    const total = parseInt(countR.rows[0].count);
+    const q = `
+      SELECT s.*, u.nombre_usuario AS creador_nombre, u.avatar AS creador_avatar,
+        COALESCE(json_agg(
+          json_build_object('id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario, 'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0))
+          ORDER BY sj.unido_en
+        ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info
+      FROM salas s
+      LEFT JOIN usuarios u ON u.id = s.id_creador
+      LEFT JOIN sala_jugadores sj ON sj.id_sala = s.id
+      LEFT JOIN usuarios uj ON uj.id = sj.id_usuario
+      WHERE s.estado IN ('terminada','cancelada')
+      GROUP BY s.id, u.nombre_usuario, u.avatar
+      ORDER BY s.actualizada_en DESC
+      LIMIT $1 OFFSET $2
+    `;
+    const r = await db.query(q, [limit, offset]);
+    return { salas: r.rows, total };
+  }
+
+  static async contarCanceladas() {
+    const r = await db.query("SELECT COUNT(*) FROM salas WHERE estado IN ('terminada','cancelada')");
+    return parseInt(r.rows[0].count);
+  }
+
   static async contarActivas() {
     const r = await db.query("SELECT COUNT(*) FROM salas WHERE estado IN ('esperando','jugando')");
     return parseInt(r.rows[0].count);
   }
 
   static async contarTerminadas() {
-    const r = await db.query("SELECT COUNT(*) FROM salas WHERE estado='terminada'");
+    const r = await db.query("SELECT COUNT(*) FROM salas WHERE estado IN ('terminada','finalizada')");
     return parseInt(r.rows[0].count);
+  }
+
+  static async listarTerminadasPorUsuario(idUsuario, limit = 10, offset = 0) {
+    const countR = await db.query(`
+      SELECT COUNT(*) FROM salas s
+      WHERE s.estado = 'finalizada'
+        AND EXISTS (
+          SELECT 1 FROM sala_jugadores sj2
+          WHERE sj2.id_sala = s.id AND sj2.id_usuario = $1
+        )
+    `, [idUsuario]);
+    const total = parseInt(countR.rows[0].count);
+
+    const r = await db.query(`
+      SELECT s.*,
+        (SELECT sj.banda FROM sala_jugadores sj WHERE sj.id_sala = s.id AND sj.id_usuario = $1) as mi_banda,
+        CASE
+          WHEN s.match_resultado IS NULL THEN null
+          WHEN s.match_resultado->>'winner' = (SELECT sj.banda FROM sala_jugadores sj WHERE sj.id_sala = s.id AND sj.id_usuario = $1)
+            THEN 'ganado'
+          ELSE 'perdido'
+        END as resultado_mio,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', sj.id_usuario,
+              'usuario_id', sj.id_usuario,
+              'nombre', u.nombre_usuario,
+              'avatar', u.avatar,
+              'banda', sj.banda
+            ) ORDER BY sj.id
+          ) FILTER (WHERE sj.id_usuario IS NOT NULL),
+          '[]'
+        ) as jugadores_info,
+        (
+          SELECT u2.nombre_usuario
+          FROM sala_jugadores sj3
+          JOIN usuarios u2 ON u2.id = sj3.id_usuario
+          WHERE sj3.id_sala = s.id
+            AND sj3.banda = s.match_resultado->>'winner'
+          LIMIT 1
+        ) as ganador_nombre
+      FROM salas s
+      LEFT JOIN sala_jugadores sj ON s.id = sj.id_sala
+      LEFT JOIN usuarios u ON u.id = sj.id_usuario
+      WHERE s.estado = 'finalizada'
+        AND EXISTS (
+          SELECT 1 FROM sala_jugadores sj2
+          WHERE sj2.id_sala = s.id AND sj2.id_usuario = $1
+        )
+      GROUP BY s.id
+      ORDER BY s.actualizada_en DESC
+      LIMIT $2 OFFSET $3
+    `, [idUsuario, limit, offset]);
+    return { salas: r.rows, total };
   }
 }
 

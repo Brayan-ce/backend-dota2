@@ -58,9 +58,11 @@ class SocketHandler {
             mensaje: r.rows[0].mensaje,
             tipo: 'texto',
             creado_en: r.rows[0].creado_en,
+            id_usuario: user.id,
             nombre_usuario: user.nombre,
             avatar: user.avatar,
-            nivel: user.nivel
+            nivel: user.nivel,
+            saldo: user.saldo
           };
           this.io.emit('chat-general:mensaje', msg);
         } catch (e) { console.error('chat-general error:', e.message); }
@@ -94,9 +96,11 @@ class SocketHandler {
             tipo: 'sticker',
             sticker_id: id,
             creado_en: r.rows[0].creado_en,
+            id_usuario: user.id,
             nombre_usuario: user.nombre,
             avatar: user.avatar,
-            nivel: user.nivel
+            nivel: user.nivel,
+            saldo: user.saldo
           };
           this.io.emit('chat-general:mensaje', msg);
         } catch (e) { console.error('chat-general:sticker error:', e.message); }
@@ -172,6 +176,7 @@ class SocketHandler {
             id_usuario: user.id,
             nombre_usuario: user.nombre,
             avatar: user.avatar,
+            saldo: user.saldo,
           };
 
           this.io.to(`sala:${idSala}`).emit('chat-sala:mensaje', msg);

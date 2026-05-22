@@ -16,6 +16,7 @@ const baneadosRoutes       = require('./baneados/baneados.routes');
 const ganadoresRoutes      = require('./ganadores/ganadores.routes');
 const partidasVivoRoutes   = require('./partidas-vivo/partidas-vivo.routes');
 const superadminRoutes     = require('./superadmin/superadmin.routes');
+const soporteRoutes        = require('./soporte/soporte.routes');
 
 module.exports = {
   authRoutes,
@@ -35,4 +36,5 @@ module.exports = {
   ganadoresRoutes,
   partidasVivoRoutes,
   superadminRoutes,
+  soporteRoutes,
 };

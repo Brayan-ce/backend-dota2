@@ -32,17 +32,23 @@ class DotaBotService {
    * @param {string} data.nombre - Nombre del lobby
    * @param {string} data.password - Contraseña (opcional)
    * @param {number} data.gameMode - Modo de juego (1 = All Pick)
+   * @param {number} data.maxJugadores - Máximo de jugadores (2 para 1v1)
    * @param {Array} data.jugadores - Lista de jugadores [{steamId, name, team}]
    */
   async createLobby(data) {
     try {
       this.logger.log(`[DotaBot] Creando lobby para sala ${data.salaId}...`);
       
+      // Body que espera el bot C# en POST /api/lobby/create
+      // maxJugadores determina el modo: 2 = 1v1 Solo Mid, >2 = All Pick
       const requestBody = {
-        name: data.nombre || `Sala #${data.salaId}`,
-        password: data.password || '',
-        game_mode: data.gameMode || 1, // All Pick por defecto
-        region: 0 // US East por defecto
+        salaId:       data.salaId,
+        nombre:       data.nombre   || `Sala #${data.salaId}`,
+        password:     data.password || '',
+        gameMode:     data.gameMode || 1,  // 1 = All Pick
+        region:       data.region   || 7,  // 7 = South America
+        maxJugadores: data.maxJugadores || 10,
+        jugadores:    data.jugadores || []
       };
 
       const response = await axios.post(
@@ -50,23 +56,23 @@ class DotaBotService {
         requestBody,
         {
           headers: { 'Content-Type': 'application/json' },
-          timeout: 30000 // 30 segundos para crear lobby
+          timeout: 150000 // 150s — el bot necesita hasta 120s para que el GC responda
         }
       );
 
       this.logger.log(`[DotaBot] Lobby creado:`, response.data);
-      // Mapear respuesta del Go service al formato esperado por el backend
+      // El bot C# responde con { success, lobbyId, password, salaId, message }
       return {
-        success: true,
-        lobbyId: response.data.lobby_id,
-        name: response.data.name
+        success:  response.data.success  ?? true,
+        lobbyId:  response.data.lobbyId  || response.data.LobbyId,
+        password: response.data.password || response.data.Password || data.password
       };
     } catch (error) {
       this.logger.error('[DotaBot] Error creando lobby:', error.message);
       if (error.response) {
         return { 
           success: false, 
-          message: error.response.data?.message || error.message 
+          message: error.response.data?.message || error.response.data?.Message || error.message 
         };
       }
       return { success: false, message: error.message };
@@ -81,9 +87,10 @@ class DotaBotService {
     try {
       this.logger.log(`[DotaBot] Invitando jugador ${steamId} al lobby ${lobbyId}...`);
       
+      // El bot C# expone POST /api/lobby/invite con { steamId }
       const response = await axios.post(
-        `${this.baseURL}/api/lobby/${lobbyId}/invite`,
-        { steam_id: steamId },
+        `${this.baseURL}/api/lobby/invite`,
+        { steamId: String(steamId) },
         {
           headers: { 'Content-Type': 'application/json' },
           timeout: 10000
@@ -119,8 +126,9 @@ class DotaBotService {
     try {
       this.logger.log(`[DotaBot] Abandonando lobby ${lobbyId}...`);
       
+      // El bot C# expone POST /api/lobby/leave (sin ID, usa el lobby actual)
       const response = await axios.post(
-        `${this.baseURL}/api/lobby/${lobbyId}/leave`,
+        `${this.baseURL}/api/lobby/leave`,
         {},
         {
           headers: { 'Content-Type': 'application/json' },
@@ -154,6 +162,38 @@ class DotaBotService {
       return response.data;
     } catch (error) {
       this.logger.error('[DotaBot] Error iniciando partida:', error.message);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * Iniciar partida (alias para consistencia)
+   */
+  async iniciarPartida(lobbyId) {
+    return this.startMatch(lobbyId);
+  }
+
+  /**
+   * Bot sale del lobby (deja la sala pero los jugadores pueden seguir)
+   */
+  async salirSlotEspectador(lobbyId) {
+    try {
+      this.logger.log(`[DotaBot] Bot saliendo del lobby ${lobbyId}...`);
+      
+      // Usamos leaveLobby para salir limpiamente del lobby
+      const response = await axios.post(
+        `${this.baseURL}/api/lobby/leave`,
+        { lobbyId: lobbyId },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 10000
+        }
+      );
+
+      this.logger.log(`[DotaBot] Bot salió del lobby exitosamente`);
+      return response.data;
+    } catch (error) {
+      this.logger.error('[DotaBot] Error saliendo del lobby:', error.message);
       return { success: false, message: error.message };
     }
   }

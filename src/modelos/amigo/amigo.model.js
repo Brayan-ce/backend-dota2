@@ -4,7 +4,7 @@ class Amigo {
   static async listar(idUsuario) {
     const q = `
       SELECT a.id, a.estado, a.creado_en,
-        u.id AS amigo_id, u.nombre_usuario, u.avatar, u.mmr
+        u.id AS amigo_id, u.nombre_usuario, u.avatar, u.mmr, u.saldo
       FROM amigos a
       JOIN usuarios u ON u.id = CASE WHEN a.id_usuario = $1::INTEGER THEN a.id_amigo ELSE a.id_usuario END
       WHERE (a.id_usuario = $1::INTEGER OR a.id_amigo = $1::INTEGER) 

@@ -168,7 +168,7 @@ router.get('/perfil-publico/:id', async (req, res) => {
   try {
     const [perfilRes, estadisticasRes, ajustesRes] = await Promise.all([
       db.query(
-        `SELECT id, nombre_usuario, steam_id, avatar, mmr, nivel, pais, creado_en
+        `SELECT id, nombre_usuario, steam_id, avatar, mmr, nivel, pais, creado_en, saldo
          FROM usuarios
          WHERE id = $1`,
         [usuarioId]
@@ -733,6 +733,55 @@ router.patch('/nombre-usuario', verificarToken, async (req, res) => {
   } catch (err) {
     console.error('Error PATCH /configuracion/nombre-usuario:', err);
     res.status(500).json({ error: 'Error al actualizar nombre' });
+  }
+});
+
+// ── POST /api/configuracion/steam-id ───────────────────────────────────────
+// Vincular Steam ID para invitaciones a lobby Dota 2
+router.post('/steam-id', verificarToken, async (req, res) => {
+  try {
+    const { id } = req.usuario;
+    const { steamId } = req.body;
+
+    if (!steamId || typeof steamId !== 'string') {
+      return res.status(400).json({ error: 'Se requiere el Steam ID' });
+    }
+
+    // Validar formato Steam ID (17 dígitos numéricos)
+    const steamIdLimpio = steamId.trim();
+    if (!/^\d{17}$/.test(steamIdLimpio)) {
+      return res.status(400).json({ error: 'Steam ID inválido. Debe tener 17 dígitos (ej: 76561198xxxxxxxx)' });
+    }
+
+    // Verificar si ya existe otro usuario con ese Steam ID
+    const existente = await db.query(
+      'SELECT id FROM usuarios WHERE steam_id = $1 AND id != $2',
+      [steamIdLimpio, id]
+    );
+    if (existente.rows.length > 0) {
+      return res.status(400).json({ error: 'Este Steam ID ya está vinculado a otra cuenta' });
+    }
+
+    // Actualizar Steam ID
+    const r = await db.query(
+      `UPDATE usuarios 
+       SET steam_id = $1, steam_actualizado_en = NOW(), actualizado_en = NOW() 
+       WHERE id = $2 
+       RETURNING id, steam_id`,
+      [steamIdLimpio, id]
+    );
+
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    res.json({ 
+      mensaje: 'Steam ID vinculado correctamente', 
+      steamId: r.rows[0].steam_id 
+    });
+  } catch (err) {
+    console.error('Error POST /configuracion/steam-id:', err);
+    res.status(500).json({ error: 'Error al vincular Steam ID' });
   }
 });
 

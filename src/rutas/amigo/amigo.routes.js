@@ -36,19 +36,19 @@ router.get('/buscar-id/:q', verificarToken, async (req, res) => {
 
     // Steam ID: número de 17 dígitos que empieza con 7656119
     if (/^\d{17}$/.test(q) && q.startsWith('7656119')) {
-      const r = await db.query('SELECT id, nombre_usuario, avatar, mmr, steam_id FROM usuarios WHERE steam_id=$1', [q]);
+      const r = await db.query('SELECT id, nombre_usuario, avatar, mmr, saldo, steam_id FROM usuarios WHERE steam_id=$1', [q]);
       usuario = r.rows[0] || null;
     }
     // ID interno: número pequeño
     else if (/^\d+$/.test(q) && parseInt(q) <= 2147483647) {
-      const r = await db.query('SELECT id, nombre_usuario, avatar, mmr, steam_id FROM usuarios WHERE id=$1', [parseInt(q)]);
+      const r = await db.query('SELECT id, nombre_usuario, avatar, mmr, saldo, steam_id FROM usuarios WHERE id=$1', [parseInt(q)]);
       usuario = r.rows[0] || null;
     }
 
     // Si no se encontró por número, buscar por nombre o email
     if (!usuario) {
       const r = await db.query(
-        'SELECT id, nombre_usuario, avatar, mmr, steam_id FROM usuarios WHERE nombre_usuario ILIKE $1 OR email ILIKE $1 LIMIT 1',
+        'SELECT id, nombre_usuario, avatar, mmr, saldo, steam_id FROM usuarios WHERE nombre_usuario ILIKE $1 OR email ILIKE $1 LIMIT 1',
         [q]
       );
       usuario = r.rows[0] || null;
@@ -116,21 +116,38 @@ router.post('/rechazar/:idSolicitud', verificarToken, async (req, res) => {
   }
 });
 
-// Estado de relación con un usuario
+// Estado de relación con un usuario - formato compatible con Perfil y MiniPerfil
 router.get('/estado/:idUsuario', verificarToken, async (req, res) => {
   try {
     const idUsuario = parseInt(req.params.idUsuario);
-    if (idUsuario === req.usuario.id) return res.json({ estado: 'mismo_usuario' });
+    if (idUsuario === req.usuario.id) {
+      return res.json({ estado: 'mismo_usuario', es_amigo: false, solicitud_pendiente: false, solicitud_enviada_por_mi: false, es_mismo_usuario: true });
+    }
     const r = await db.query(
       'SELECT id, estado, id_usuario FROM amigos WHERE (id_usuario=$1 AND id_amigo=$2) OR (id_usuario=$2 AND id_amigo=$1)',
       [req.usuario.id, idUsuario]
     );
-    if (r.rows.length === 0) return res.json({ estado: 'ninguno' });
+    if (r.rows.length === 0) {
+      return res.json({ estado: 'ninguno', es_amigo: false, solicitud_pendiente: false, solicitud_enviada_por_mi: false });
+    }
     const row = r.rows[0];
-    if (row.estado === 'aceptado') return res.json({ estado: 'amigos', id: row.id });
-    if (row.estado === 'pendiente' && row.id_usuario === req.usuario.id) return res.json({ estado: 'solicitud_enviada', id: row.id });
-    if (row.estado === 'pendiente') return res.json({ estado: 'solicitud_recibida', id: row.id });
-    res.json({ estado: 'ninguno' });
+    const esAmigo = row.estado === 'aceptado';
+    const solicitudPendiente = row.estado === 'pendiente';
+    const solicitudEnviadaPorMi = row.estado === 'pendiente' && row.id_usuario === req.usuario.id;
+
+    // Determinar estado legado para compatibilidad con Perfil
+    let estadoLegado = 'ninguno';
+    if (esAmigo) estadoLegado = 'amigos';
+    else if (solicitudEnviadaPorMi) estadoLegado = 'solicitud_enviada';
+    else if (solicitudPendiente) estadoLegado = 'solicitud_recibida';
+
+    res.json({
+      estado: estadoLegado,
+      es_amigo: esAmigo,
+      solicitud_pendiente: solicitudPendiente,
+      solicitud_enviada_por_mi: solicitudEnviadaPorMi,
+      id_relacion: row.id
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
