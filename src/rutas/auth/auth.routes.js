@@ -514,4 +514,20 @@ router.post('/logout', verificarToken, async (req, res) => {
   }
 });
 
+router.get('/check-nombre', verificarToken, async (req, res) => {
+  try {
+    const nombre = String(req.query.nombre || '').trim();
+    if (!nombre || nombre.length < 3 || nombre.length > 20) {
+      return res.json({ disponible: false });
+    }
+    const { rows } = await db.query(
+      'SELECT id FROM usuarios WHERE LOWER(nombre_usuario) = LOWER($1) AND id != $2',
+      [nombre, req.usuario.id]
+    );
+    res.json({ disponible: rows.length === 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

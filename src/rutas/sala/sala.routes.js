@@ -541,7 +541,7 @@ router.post('/premium/cambiar-nombre', verificarToken, async (req, res) => {
       return res.status(400).json({ error: 'El nombre solo puede contener letras, números, guiones y guiones bajos' });
     }
     
-    const client = await db.getClient();
+    const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
       
@@ -583,7 +583,7 @@ router.post('/premium/cambiar-nombre', verificarToken, async (req, res) => {
       
       // Verificar que el nombre no esté en uso
       const existe = await client.query(
-        'SELECT id FROM usuarios WHERE nombre_usuario = $1 AND id != $2',
+        'SELECT id FROM usuarios WHERE LOWER(nombre_usuario) = LOWER($1) AND id != $2',
         [nombreLimpio, req.usuario.id]
       );
       
