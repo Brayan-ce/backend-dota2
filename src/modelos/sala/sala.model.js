@@ -6,13 +6,23 @@ class Sala {
       SELECT s.*, u.nombre_usuario AS creador_nombre, u.avatar AS creador_avatar,
         COUNT(sj.id) AS jugadores_count,
         COALESCE(json_agg(
-          json_build_object('id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario, 'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0))
+          json_build_object(
+            'id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario,
+            'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0),
+            'kills',     sjs.kills,
+            'deaths',    sjs.deaths,
+            'assists',   sjs.assists,
+            'net_worth', sjs.net_worth,
+            'gpm',       sjs.gpm,
+            'xpm',       sjs.xpm
+          )
           ORDER BY sj.unido_en
         ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info
       FROM salas s
       LEFT JOIN usuarios u ON u.id = s.id_creador
       LEFT JOIN sala_jugadores sj ON sj.id_sala = s.id
       LEFT JOIN usuarios uj ON uj.id = sj.id_usuario
+      LEFT JOIN sala_jugadores_stats sjs ON sjs.id_sala = s.id AND sjs.id_usuario = uj.id
       WHERE s.estado IN ('esperando','jugando')
       GROUP BY s.id, u.nombre_usuario, u.avatar
       ORDER BY s.creada_en DESC
@@ -85,7 +95,16 @@ class Sala {
     const q = `
       SELECT s.*, u.nombre_usuario AS creador_nombre, u.avatar AS creador_avatar,
         COALESCE(json_agg(
-          json_build_object('id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario, 'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0))
+          json_build_object(
+            'id', uj.id, 'avatar', uj.avatar, 'nombre', uj.nombre_usuario,
+            'banda', sj.banda, 'mmr', COALESCE(uj.mmr, 0),
+            'kills',     sjs.kills,
+            'deaths',    sjs.deaths,
+            'assists',   sjs.assists,
+            'net_worth', sjs.net_worth,
+            'gpm',       sjs.gpm,
+            'xpm',       sjs.xpm
+          )
           ORDER BY sj.unido_en
         ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores_info,
         (
@@ -99,6 +118,7 @@ class Sala {
       LEFT JOIN usuarios u ON u.id = s.id_creador
       LEFT JOIN sala_jugadores sj ON sj.id_sala = s.id
       LEFT JOIN usuarios uj ON uj.id = sj.id_usuario
+      LEFT JOIN sala_jugadores_stats sjs ON sjs.id_sala = s.id AND sjs.id_usuario = uj.id
       WHERE s.estado = 'finalizada'
       GROUP BY s.id, u.nombre_usuario, u.avatar
       ORDER BY s.actualizada_en DESC

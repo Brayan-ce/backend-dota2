@@ -676,13 +676,19 @@ router.get('/salas/:id', verificarSuperadminToken, async (req, res) => {
         COUNT(sj.id)     AS jugadores_count,
         COALESCE(json_agg(
           json_build_object(
-            'id',     uj.id,
-            'nombre', uj.nombre_usuario,
-            'avatar', uj.avatar,
+            'id',       uj.id,
+            'nombre',   uj.nombre_usuario,
+            'avatar',   uj.avatar,
             'steam_id', uj.steam_id,
-            'mmr',    COALESCE(uj.mmr, 0),
-            'banda',  sj.banda,
-            'equipo', sj.equipo
+            'mmr',      COALESCE(uj.mmr, 0),
+            'banda',    sj.banda,
+            'equipo',   sj.equipo,
+            'kills',     sjs.kills,
+            'deaths',    sjs.deaths,
+            'assists',   sjs.assists,
+            'net_worth', sjs.net_worth,
+            'gpm',       sjs.gpm,
+            'xpm',       sjs.xpm
           ) ORDER BY sj.unido_en
         ) FILTER (WHERE uj.id IS NOT NULL), '[]') AS jugadores
       FROM salas s
@@ -696,6 +702,7 @@ router.get('/salas/:id', verificarSuperadminToken, async (req, res) => {
       ) pv ON TRUE
       LEFT JOIN sala_jugadores sj ON sj.id_sala = s.id
       LEFT JOIN usuarios       uj ON uj.id = sj.id_usuario
+      LEFT JOIN sala_jugadores_stats sjs ON sjs.id_sala = s.id AND sjs.id_usuario = uj.id
       WHERE s.id = $1
       GROUP BY s.id, u.nombre_usuario, u.avatar, pv.id, pv.titulo, pv.estado, pv.match_id, pv.delay_segundos
       LIMIT 1`,
@@ -2675,7 +2682,73 @@ router.post('/salas/:id/consultar-resultado', verificarSuperadminToken, async (r
     ]);
     
     console.log(`[SUPERADMIN] Resultado guardado para sala ${id}: ${resultado} (match ${matchEncontrado.match_id})`);
-    
+
+    // ── Poblar sala_jugadores_stats desde los players del match ──────────────
+    let statsGuardados = 0;
+    try {
+      const players = matchEncontrado.players || [];
+      if (players.length > 0) {
+        // Borrar stats previos de esta sala (re-consulta limpia)
+        await db.query('DELETE FROM sala_jugadores_stats WHERE id_sala = $1', [id]);
+
+        for (const p of players) {
+          // Steam API devuelve account_id (32-bit), convertir a steam_id 64-bit
+          const accountId = p.account_id;
+          let steamId64 = null;
+          if (accountId && accountId !== 4294967295) { // 4294967295 = anónimo
+            steamId64 = String(BigInt(accountId) + BigInt('76561197960265728'));
+          }
+
+          // Determinar banda por player_slot: 0-4 = radiant, 128-132 = dire
+          const banda = (p.player_slot !== undefined && p.player_slot < 128) ? 'radiant' : 'dire';
+
+          // Buscar id_usuario por steam_id
+          let idUsuario = null;
+          if (steamId64) {
+            const uRes = await db.query('SELECT id FROM usuarios WHERE steam_id = $1 LIMIT 1', [steamId64]);
+            if (uRes.rows.length > 0) idUsuario = uRes.rows[0].id;
+          }
+
+          await db.query(`
+            INSERT INTO sala_jugadores_stats
+              (id_sala, id_usuario, steam_id, banda, kills, deaths, assists, net_worth, gpm, xpm,
+               hero_damage, tower_damage, hero_healing, last_hits, denies, level, hero_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+            ON CONFLICT (id_sala, steam_id) DO UPDATE SET
+              kills=EXCLUDED.kills, deaths=EXCLUDED.deaths, assists=EXCLUDED.assists,
+              net_worth=EXCLUDED.net_worth, gpm=EXCLUDED.gpm, xpm=EXCLUDED.xpm,
+              hero_damage=EXCLUDED.hero_damage, tower_damage=EXCLUDED.tower_damage,
+              hero_healing=EXCLUDED.hero_healing, last_hits=EXCLUDED.last_hits,
+              denies=EXCLUDED.denies, level=EXCLUDED.level, hero_id=EXCLUDED.hero_id,
+              id_usuario=COALESCE(EXCLUDED.id_usuario, sala_jugadores_stats.id_usuario)
+          `, [
+            id,
+            idUsuario,
+            steamId64,
+            banda,
+            p.kills || 0,
+            p.deaths || 0,
+            p.assists || 0,
+            p.net_worth || 0,
+            p.gold_per_min || 0,
+            p.xp_per_min || 0,
+            p.hero_damage || 0,
+            p.tower_damage || 0,
+            p.hero_healing || 0,
+            p.last_hits || 0,
+            p.denies || 0,
+            p.level || 1,
+            p.hero_id || null,
+          ]);
+          statsGuardados++;
+        }
+        console.log(`[SUPERADMIN] Stats guardados para ${statsGuardados} jugadores en sala ${id}`);
+      }
+    } catch (statsErr) {
+      console.warn(`[SUPERADMIN] Error guardando stats de jugadores:`, statsErr.message);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     res.json({
       success: true,
       match_id: matchEncontrado.match_id,
@@ -2684,6 +2757,7 @@ router.post('/salas/:id/consultar-resultado', verificarSuperadminToken, async (r
       duracion_formateada: `${Math.floor(matchEncontrado.duration / 60)}:${(matchEncontrado.duration % 60).toString().padStart(2, '0')}`,
       fecha_inicio: new Date(matchEncontrado.start_time * 1000).toISOString(),
       jugadores_encontrados: (sala.jugadores || []).filter(j => j.steam_id).length,
+      stats_guardados: statsGuardados,
       metodo_busqueda: sala.match_id && matchIdUsado === sala.match_id ? 'match_id_directo' : 'jugadores',
       datos_completos: matchEncontrado
     });
@@ -2691,6 +2765,55 @@ router.post('/salas/:id/consultar-resultado', verificarSuperadminToken, async (r
   } catch (error) {
     console.error(`[SUPERADMIN] Error consultando resultado:`, error);
     res.status(500).json({ error: 'Error al consultar resultado de la partida', details: error.message });
+  }
+});
+
+// POST /api/superadmin/salas/:id/stats-manuales - Subir KDA/gold/gpm/xpm manualmente por jugador
+router.post('/salas/:id/stats-manuales', verificarSuperadminToken, async (req, res) => {
+  const { id } = req.params;
+  const { jugadores } = req.body; // [{ id_usuario, banda, kills, deaths, assists, net_worth, gpm, xpm }]
+
+  if (!Array.isArray(jugadores) || jugadores.length === 0) {
+    return res.status(400).json({ error: 'Se requiere un array de jugadores' });
+  }
+
+  try {
+    // Borrar stats previos y reinsertar
+    await db.query('DELETE FROM sala_jugadores_stats WHERE id_sala = $1', [id]);
+
+    for (const j of jugadores) {
+      if (!j.id_usuario) continue;
+      // Obtener steam_id del usuario
+      const uRes = await db.query('SELECT steam_id FROM usuarios WHERE id = $1 LIMIT 1', [j.id_usuario]);
+      const steamId = uRes.rows[0]?.steam_id || null;
+
+      await db.query(`
+        INSERT INTO sala_jugadores_stats
+          (id_sala, id_usuario, steam_id, banda, kills, deaths, assists, net_worth, gpm, xpm)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT (id_sala, id_usuario) DO UPDATE SET
+          banda=EXCLUDED.banda, kills=EXCLUDED.kills, deaths=EXCLUDED.deaths,
+          assists=EXCLUDED.assists, net_worth=EXCLUDED.net_worth,
+          gpm=EXCLUDED.gpm, xpm=EXCLUDED.xpm
+      `, [
+        id,
+        j.id_usuario,
+        steamId,
+        j.banda || 'radiant',
+        parseInt(j.kills) || 0,
+        parseInt(j.deaths) || 0,
+        parseInt(j.assists) || 0,
+        parseInt(j.net_worth) || 0,
+        parseInt(j.gpm) || 0,
+        parseInt(j.xpm) || 0,
+      ]);
+    }
+
+    console.log(`[SUPERADMIN] Stats manuales guardados para sala ${id}: ${jugadores.length} jugadores`);
+    res.json({ ok: true, guardados: jugadores.length });
+  } catch (e) {
+    console.error('[SUPERADMIN] Error stats-manuales:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
