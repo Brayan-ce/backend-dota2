@@ -374,6 +374,109 @@ router.post('/bono-bienvenida/marcar-visto', verificarToken, async (req, res) =>
   }
 });
 
+// ─── VINCULAR STEAM VIA OPENID (para usuarios ya registrados) ────────────────
+// GET /api/auth/steam-openid/init?token=JWT
+// Redirige al usuario a Steam para autenticarse
+router.get('/steam-openid/init', (req, res) => {
+  const { token } = req.query;
+  const baseUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3005}`;
+
+  const returnTo = `${backendUrl}/api/auth/steam-openid/callback?token=${encodeURIComponent(token || '')}`;
+  const realm = backendUrl;
+
+  const params = new URLSearchParams({
+    'openid.ns':         'http://specs.openid.net/auth/2.0',
+    'openid.mode':       'checkid_setup',
+    'openid.return_to':  returnTo,
+    'openid.realm':      realm,
+    'openid.identity':   'http://specs.openid.net/auth/2.0/identifier_select',
+    'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select',
+  });
+
+  res.redirect(`https://steamcommunity.com/openid/login?${params.toString()}`);
+});
+
+// GET /api/auth/steam-openid/callback
+// Steam redirige aquí con el claimed_id → extrae SteamID → guarda en DB → cierra popup
+router.get('/steam-openid/callback', async (req, res) => {
+  try {
+    const { token } = req.query;
+    const claimedId = req.query['openid.claimed_id'] || '';
+
+    // Extraer SteamID64 del claimed_id: https://steamcommunity.com/openid/id/76561198XXXXXXXX
+    const match = claimedId.match(/\/openid\/id\/(\d{17,})$/);
+    if (!match) {
+      return res.send(`<script>window.opener&&window.opener.postMessage({type:'STEAM_VINCULAR_ERROR',error:'No se pudo obtener el Steam ID de Steam'},'*');window.close();</script>`);
+    }
+    const steamId = match[1];
+
+    // Verificar token JWT del usuario
+    let usuarioId;
+    try {
+      const jwt = require('jsonwebtoken');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      usuarioId = decoded.id;
+    } catch (_) {
+      return res.send(`<script>window.opener&&window.opener.postMessage({type:'STEAM_VINCULAR_ERROR',error:'Sesión expirada, vuelve a intentarlo'},'*');window.close();</script>`);
+    }
+
+    // Verificar que el SteamID no esté en uso por otro usuario
+    const existente = await db.query('SELECT id FROM usuarios WHERE steam_id=$1 AND id!=$2', [steamId, usuarioId]);
+    if (existente.rows.length > 0) {
+      return res.send(`<script>window.opener&&window.opener.postMessage({type:'STEAM_VINCULAR_ERROR',error:'Este Steam ID ya está vinculado a otra cuenta'},'*');window.close();</script>`);
+    }
+
+    // Obtener datos de Steam para actualizar avatar y nombre si no los tiene
+    let avatarUrl = null, steamName = null;
+    try {
+      const perfil = await steamService.obtenerJugador(steamId);
+      if (perfil) { avatarUrl = perfil.avatarfull; steamName = perfil.personaname; }
+    } catch (_) {}
+
+    if (avatarUrl) {
+      await db.query(
+        `UPDATE usuarios SET steam_id=$1, avatar=$2, steam_actualizado_en=NOW(), actualizado_en=NOW() WHERE id=$3`,
+        [steamId, avatarUrl, usuarioId]
+      );
+    } else {
+      await db.query(
+        `UPDATE usuarios SET steam_id=$1, steam_actualizado_en=NOW(), actualizado_en=NOW() WHERE id=$2`,
+        [steamId, usuarioId]
+      );
+    }
+
+    return res.send(`<script>window.opener&&window.opener.postMessage({type:'STEAM_VINCULAR_OK',steamId:'${steamId}',steamName:${JSON.stringify(steamName || '')},avatar:${JSON.stringify(avatarUrl || '')}},'*');window.close();</script>`);
+  } catch (err) {
+    console.error('[Steam OpenID callback]', err);
+    return res.send(`<script>window.opener&&window.opener.postMessage({type:'STEAM_VINCULAR_ERROR',error:'Error interno'},'*');window.close();</script>`);
+  }
+});
+
+// POST /api/auth/steam-sync-avatar
+// Sincroniza avatar desde Steam para el usuario autenticado que ya tiene steam_id
+router.post('/steam-sync-avatar', verificarToken, async (req, res) => {
+  try {
+    const { id } = req.usuario;
+    const r = await db.query('SELECT steam_id FROM usuarios WHERE id=$1', [id]);
+    const steamId = r.rows[0]?.steam_id;
+    if (!steamId) return res.status(400).json({ error: 'No tienes Steam vinculado' });
+
+    const perfil = await steamService.obtenerJugador(steamId);
+    if (!perfil) return res.status(404).json({ error: 'No se encontró el perfil de Steam' });
+
+    await db.query(
+      `UPDATE usuarios SET avatar=$1, actualizado_en=NOW() WHERE id=$2`,
+      [perfil.avatarfull, id]
+    );
+
+    res.json({ ok: true, avatar: perfil.avatarfull, steamName: perfil.personaname });
+  } catch (err) {
+    console.error('[steam-sync-avatar]', err);
+    res.status(500).json({ error: 'Error al sincronizar avatar' });
+  }
+});
+
 // Ruta para obtener MMR en tiempo real via GameCoordinator
 router.get('/mmr/:steamId', async (req, res) => {
   try {
